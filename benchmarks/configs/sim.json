@@ -1,0 +1,19 @@
+{
+  "port": 18080,
+  "default_model": "default",
+  "max_concurrent_per_node": 8,
+  "sglang_instances": [
+    { "group": "local", "host": "127.0.0.1", "port": 31000, "max_concurrent": 8 },
+    { "group": "local", "host": "127.0.0.1", "port": 31001, "max_concurrent": 8 },
+    { "group": "local", "host": "127.0.0.1", "port": 31002, "max_concurrent": 8 },
+    { "group": "local", "host": "127.0.0.1", "port": 31003, "max_concurrent": 8 }
+  ],
+  "reliability": {
+    "max_attempts": 3,
+    "attempt_timeout": "1s",
+    "stream_idle_timeout": "2s",
+    "retry_backoff": "20ms",
+    "breaker": { "enabled": true, "failure_threshold": 3, "open_duration": "2s", "max_open_duration": "10s", "half_open_max": 1 },
+    "health": { "enabled": true, "interval": "500ms", "timeout": "300ms", "path": "/health", "unhealthy_threshold": 2, "healthy_threshold": 1 }
+  }
+}
