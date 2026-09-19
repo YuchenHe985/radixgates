@@ -1,0 +1,222 @@
+services:
+  # ── GPU 0: Prefill-only SGLang ──────────────────────────────────────────────
+  # Handles compute-intensive prompt processing.
+  # NOT a direct request entry point — sglang_router routes prefill work here.
+  # Exposes bootstrap port 8998 for KV cache handoff coordination.
+  sglang-prefill:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-prefill
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all   # both GPUs visible; --base-gpu-id controls which one
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30000:30000"   # SGLang HTTP API
+      - "8998:8998"     # Bootstrap port for KV cache coordination
+    command: >
+      python3 -m sglang.launch_server
+        --model-path NousResearch/Meta-Llama-3-8B-Instruct
+        --port 30000
+        --host 0.0.0.0
+        --base-gpu-id 0
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --disaggregation-mode prefill
+        --disaggregation-bootstrap-port 8998
+        --disaggregation-transfer-backend ${PREFILL_BACKEND:-mooncake}
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  # ── GPU 1: Decode-only SGLang ───────────────────────────────────────────────
+  # Handles memory-bandwidth-intensive token generation.
+  # sglang_router is the request entry point; this node receives decode work.
+  sglang-decode:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-decode
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all   # both GPUs visible; --base-gpu-id 1 picks GPU 1
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30001:30001"   # SGLang HTTP API
+    command: >
+      python3 -m sglang.launch_server
+        --model-path NousResearch/Meta-Llama-3-8B-Instruct
+        --port 30001
+        --host 0.0.0.0
+        --base-gpu-id 1
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --disaggregation-mode decode
+        --disaggregation-transfer-backend ${DECODE_BACKEND:-mooncake}
+        --trust-remote-code
+    depends_on:
+      sglang-prefill:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  # ── SGLang Router — PD Disaggregation Coordinator ──────────────────────────
+  # Entry point for all inference requests in PD mode.
+  # Routes prefill work → sglang-prefill, decode work → sglang-decode.
+  # RadixGates Gateway routes here; this node handles the P/D split internally.
+  sglang-router:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-router
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    command: >
+      python3 -m sglang_router.launch_router
+        --pd-disaggregation
+        --prefill http://sglang-prefill:30000 8998
+        --decode http://sglang-decode:30001
+        --host 0.0.0.0
+        --port 9000
+    depends_on:
+      sglang-prefill:
+        condition: service_healthy
+      sglang-decode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── RadixGates Go Gateway ───────────────────────────────────────────────────
+  # Provides: prefix-hash routing, semaphore backpressure, /metrics, SSE proxy.
+  #
+  # Single-machine PD (default):
+  #   docker compose -f docker-compose.pd.yml up -d
+  #   → routes to local sglang-router only
+  #
+  # Dual-machine PD (add Machine 2):
+  #   M2_HOST=<machine2_ip> docker compose -f docker-compose.pd.yml up -d
+  #   → prefix-hash routes across M1 sglang-router AND M2 sglang-router
+  #   → same prefix → same machine → KV Cache hits on decode node
+  gateway:
+    image: unicoregpu2020/radixgates:latest
+    container_name: gateway
+    restart: unless-stopped
+    working_dir: /app/gateway
+    environment:
+      - M2_HOST=${M2_HOST:-}        # set to machine2 IP for dual-machine PD
+      - M2_PORT=${M2_PORT:-9000}    # sglang_router port on machine2 (default 9000)
+    command:
+      - sh
+      - -c
+      - |
+        # Build sglang_instances: always include local router; add M2 if M2_HOST is set.
+        # Use $$ to prevent Docker Compose from interpolating shell variables.
+        INSTANCES='[{"group":"m1","role":"","host":"sglang-router","port":9000,"max_concurrent":8}'
+        if [ -n "$$M2_HOST" ]; then
+          INSTANCES="$$INSTANCES,{\"group\":\"m2\",\"role\":\"\",\"host\":\"$$M2_HOST\",\"port\":$$M2_PORT,\"max_concurrent\":8}"
+        fi
+        INSTANCES="$$INSTANCES]"
+
+        cat > /app/gateway/config/config.json <<EOF
+        {
+          "port": 8080,
+          "routing_mode": "direct",
+          "default_model": "NousResearch/Meta-Llama-3-8B-Instruct",
+          "log_level": "info",
+          "max_concurrent_per_node": 8,
+          "sglang_instances": $$INSTANCES
+        }
+        EOF
+        exec /usr/local/bin/sglang_gateway
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # allows container to reach M1 host tunnels
+    depends_on:
+      sglang-router:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  hf_cache:
+
+# =============================================================================
+# PD Disaggregation Stack — RadixGates v0.3
+#
+# ── Single-machine (default) ──────────────────────────────────────────────────
+#
+#   docker compose -f docker-compose.pd.yml up -d
+#
+#   Architecture:
+#     Client → Gateway:8080 → sglang_router:9000 → prefill:30000 + decode:30001
+#
+# ── Dual-machine (partition + PD) ────────────────────────────────────────────
+#
+#   # Machine 2: start PD worker node (prefill + decode + sglang_router)
+#   docker compose -f docker-compose.pd-node.yml up -d
+#
+#   # Machine 1: start full stack with M2 address
+#   M2_HOST=<machine2_ip> docker compose -f docker-compose.pd.yml up -d
+#
+#   Architecture:
+#     Client → Gateway:8080
+#       ├─ prefix_hash even → sglang_router_M1:9000 → prefill_M1 + decode_M1
+#       └─ prefix_hash odd  → sglang_router_M2:9000 → prefill_M2 + decode_M2
+#
+#   Benefits:
+#     - Prefix-hash routing → same system prompt → same machine → KV Cache hit
+#     - PD disaggregation   → prefill/decode don't share GPU → higher throughput
+#
+# ── Monitor & Verify ──────────────────────────────────────────────────────────
+#
+#   docker compose -f docker-compose.pd.yml logs -f
+#
+#   # Verify
+#   curl http://localhost:8080/health
+#   curl http://localhost:9000/health
+#
+#   # Run PD demo
+#   python3 examples/pd_demo.py
+#
+# Architecture:
+#   Client
+#     → RadixGates Gateway :8080  (prefix-hash routing, semaphore, /metrics)
+#     → sglang_router :9000       (PD coordinator: splits prefill / decode)
+#     → sglang-prefill :30000     (GPU 0 — compute-intensive prefill)
+#     → sglang-decode  :30001     (GPU 1 — bandwidth-intensive decode)
+#
+# Transfer backends (PREFILL_BACKEND / DECODE_BACKEND):
+#   mooncake — CUDA IPC for same-machine (RTX 4090 × 2 via PCIe); default
+#   fake     — decode-side only; prefill must always use mooncake or nixl
+#   nixl     — NIXL library (requires nixl installed in image)
+#
+# Hardware requirements:
+#   - 1 machine with 2× GPU (RTX 4090 works; A100 NVLink is faster)
+#   - Minimum VRAM: 2 × 24 GB (8B model, one GPU per role)
+#   - Note: PD disaggregation yields the most benefit on 70B+ models.
+#     On Llama-3-8B the prefill is already fast; use this stack to
+#     demonstrate the architecture, then scale up model size.
+# =============================================================================

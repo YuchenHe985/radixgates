@@ -1,0 +1,127 @@
+# =============================================================================
+#  PD Worker Node — RadixGates v0.3
+#
+#  Deploy this on Machine 2 (and any additional machines).
+#  Machine 1 runs docker-compose.pd.yml which hosts the Gateway.
+#
+#  Architecture:
+#    Machine 1 (gateway + PD pair):  docker-compose.pd.yml
+#    Machine 2+ (PD pair only):      docker-compose.pd-node.yml  ← this file
+#
+#  On Machine 1, set M2_HOST=<machine2_ip> before starting:
+#    M2_HOST=10.0.0.2 docker compose -f docker-compose.pd.yml up -d
+#
+#  Usage on Machine 2:
+#    docker compose -f docker-compose.pd-node.yml up -d
+#
+#  Prerequisites on Machine 2:
+#    - docker + nvidia-container-toolkit (2x GPU)
+#    - Ports open: 9000 (sglang_router), 30000 (prefill), 30001 (decode), 8998 (bootstrap)
+# =============================================================================
+
+name: radixgates-pd-node
+
+services:
+  # ── GPU 0: Prefill-only SGLang ──────────────────────────────────────────────
+  sglang-prefill:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-prefill
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30000:30000"
+      - "8998:8998"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL:-NousResearch/Meta-Llama-3-8B-Instruct}
+        --port 30000
+        --host 0.0.0.0
+        --base-gpu-id 0
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --disaggregation-mode prefill
+        --disaggregation-bootstrap-port 8998
+        --disaggregation-transfer-backend ${PREFILL_BACKEND:-mooncake}
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  # ── GPU 1: Decode-only SGLang ───────────────────────────────────────────────
+  sglang-decode:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-decode
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30001:30001"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL:-NousResearch/Meta-Llama-3-8B-Instruct}
+        --port 30001
+        --host 0.0.0.0
+        --base-gpu-id 1
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --disaggregation-mode decode
+        --disaggregation-transfer-backend ${DECODE_BACKEND:-mooncake}
+        --trust-remote-code
+    depends_on:
+      sglang-prefill:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  # ── SGLang Router — PD Coordinator for this node ───────────────────────────
+  # Entry point for this machine's PD pair.
+  # Machine 1's Gateway routes to this via prefix-hash.
+  sglang-router:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-router
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    command: >
+      python3 -m sglang_router.launch_router
+        --pd-disaggregation
+        --prefill http://sglang-prefill:30000 8998
+        --decode http://sglang-decode:30001
+        --host 0.0.0.0
+        --port 9000
+    depends_on:
+      sglang-prefill:
+        condition: service_healthy
+      sglang-decode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  hf_cache:

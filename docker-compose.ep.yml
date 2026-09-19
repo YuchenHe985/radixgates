@@ -1,0 +1,170 @@
+services:
+  # ── EP SGLang Instance (MoE model, Expert Parallelism across GPU 0 + GPU 1) ──
+  #
+  # Expert Parallelism (EP) splits MoE Expert FFN weights across GPUs.
+  # Each GPU holds a subset of Experts; tokens are routed via All-to-All.
+  #
+  # Layer-level communication breakdown:
+  #   Attention layers → All-Reduce  (same as TP)
+  #   Expert FFN layers → All-to-All (EP-specific: token dispatch + gather)
+  #
+  # Default model: Qwen/Qwen3-30B-A3B
+  #   - 128 Experts total, 8 activated per token
+  #   - EP=2: GPU 0 holds Expert 0-63, GPU 1 holds Expert 64-127
+  #   - Token routed to Expert on the other GPU → crosses via All-to-All
+  #   - Fits in 2× RTX 4090 (24 GB each); ~$0.6-1.0/hr on Vast.ai
+  sglang-ep:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-ep
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30000:30000"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL_PATH:-Qwen/Qwen3-30B-A3B}
+        --port 30000
+        --host 0.0.0.0
+        --tensor-parallel-size ${TP_SIZE:-2}
+        --enable-expert-parallel
+        --mem-fraction-static 0.85
+        --enable-prefix-caching
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  # ── RadixGates Go Gateway ──────────────────────────────────────────────────
+  # EP and All-to-All are fully transparent above the SGLang HTTP layer.
+  # Gateway sends standard /v1/chat requests; SGLang handles token routing internally.
+  gateway:
+    image: unicoregpu2020/radixgates:latest
+    container_name: gateway
+    restart: unless-stopped
+    working_dir: /app/gateway
+    command:
+      - sh
+      - -c
+      - |
+        cat > /app/gateway/config/config.json <<EOF
+        {
+          "port": 8080,
+          "routing_mode": "direct",
+          "default_model": "$$MODEL_PATH",
+          "log_level": "info",
+          "max_concurrent_per_node": 8,
+          "sglang_instances": [
+            {"group": "ep", "role": "", "host": "sglang-ep", "port": 30000, "max_concurrent": 8}
+          ]
+        }
+        EOF
+        exec /usr/local/bin/sglang_gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      sglang-ep:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  hf_cache:
+
+# =============================================================================
+# Expert Parallel (EP) Stack — RadixGates
+#
+# ── What EP + All-to-All does ────────────────────────────────────────────────
+#
+#   MoE model: each token activates only K out of N Experts (e.g. 8/128).
+#   EP splits Expert weights across GPUs so each GPU holds N/EP Experts.
+#
+#   Per-layer flow with EP=2 (128 Experts, GPU 0 → Expert 0-63, GPU 1 → 64-127):
+#
+#     Step 1 — Dispatch (All-to-All):
+#       GPU 0 has tokens [A, B, C, D].
+#       Token A → Expert 70 (on GPU 1) → sent to GPU 1
+#       Token B → Expert 5  (on GPU 0) → stays on GPU 0
+#       GPU 1 does the same in reverse.
+#
+#     Step 2 — Expert compute:
+#       Each GPU runs its local Experts on the tokens it received.
+#
+#     Step 3 — Gather (All-to-All):
+#       Results are sent back to the originating GPU.
+#       GPU 0 collects output for tokens A (from GPU 1) and B (local).
+#
+#   Attention layers still use All-Reduce (same as TP).
+#   Expert FFN layers use All-to-All instead of All-Reduce.
+#
+# ── EP vs TP ──────────────────────────────────────────────────────────────────
+#
+#   TP  — weight matrix columns split; All-Reduce after every linear layer
+#         Every GPU participates in every Expert computation
+#         Communication: predictable, fixed size (activation tensor)
+#
+#   EP  — Expert FFNs split; All-to-All for token dispatch + gather
+#         Each GPU runs only its own Experts
+#         Communication: variable size (depends on routing, can be unbalanced)
+#
+# ── Minimum hardware for real All-to-All EP ──────────────────────────────────
+#
+#   EP=1 (single GPU): no All-to-All, all Experts local, pure MoE compute
+#   EP=2 (2 GPUs):     All-to-All kicks in ← minimum to observe EP behavior
+#
+#   Cheapest All-to-All EP demo on Vast.ai (~$0.6-1.0/hr):
+#     Machine : 2× RTX 4090 (24 GB each)
+#     Model   : Qwen/Qwen3-30B-A3B  (128 Experts, activates 8 per token)
+#     Result  : GPU 0 holds Expert 0-63, GPU 1 holds Expert 64-127
+#               ~50% of token routing decisions require cross-GPU All-to-All
+#
+#   Alternative — DeepSeek-V2-Lite (~10 GB, even cheaper):
+#     Machine : 2× RTX 3090 or 2× L4 (24 GB each)
+#     Model   : deepseek-ai/DeepSeek-V2-Lite  (64 Experts, activates 6 per token)
+#     Command : MODEL_PATH=deepseek-ai/DeepSeek-V2-Lite docker compose -f docker-compose.ep.yml up -d
+#
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#
+#   # Default (Qwen3-30B-A3B, EP=2 on GPU 0+1)
+#   docker compose -f docker-compose.ep.yml up -d
+#
+#   # DeepSeek-V2-Lite (smaller, faster to download)
+#   MODEL_PATH=deepseek-ai/DeepSeek-V2-Lite docker compose -f docker-compose.ep.yml up -d
+#
+#   # 4× A100: EP=4 (128 Experts → 32 per GPU, All-to-All across 4 GPUs)
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 \
+#     docker compose -f docker-compose.ep.yml up -d
+#   python3 examples/ep_demo.py
+#
+#   # 4× A100: larger MoE model with EP=4
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 \
+#     MODEL_PATH=deepseek-ai/DeepSeek-V2 \
+#     docker compose -f docker-compose.ep.yml up -d
+#
+#   # Verify EP active
+#   curl http://localhost:30000/get_server_args | python3 -m json.tool | grep expert
+#
+#   # Run demo
+#   python3 examples/ep_demo.py
+#
+# ── Architecture ──────────────────────────────────────────────────────────────
+#
+#   Client
+#     → RadixGates Gateway :8080
+#     → SGLang EP instance :30000
+#          Attention layer:  GPU 0 + GPU 1  (All-Reduce, same as TP)
+#          Expert FFN layer: GPU 0 [Expert 0-63]  ←All-to-All→  GPU 1 [Expert 64-127]
+#
+# =============================================================================

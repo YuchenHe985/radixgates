@@ -1,0 +1,144 @@
+services:
+  # ── TP SGLang Instance (spans GPU 0 + GPU 1) ─────────────────────────────────
+  # One logical SGLang server using --tensor-parallel-size 2.
+  # SGLang internally shards attention heads and FFN weights across both GPUs.
+  # The Gateway sees a single HTTP endpoint — TP is completely transparent above this layer.
+  #
+  # Default model: Qwen2.5-14B-Instruct (28 GB fp16) — requires 2×24 GB GPUs.
+  # Override via MODEL_PATH env var.
+  sglang-tp:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-tp
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}   # 2-GPU default; set 0,1,2,3 for 4-GPU
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30000:30000"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL_PATH:-Qwen/Qwen2.5-14B-Instruct}
+        --port 30000
+        --host 0.0.0.0
+        --tensor-parallel-size ${TP_SIZE:-2}
+        --mem-fraction-static 0.85
+        --enable-prefix-caching
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  # ── RadixGates Go Gateway ─────────────────────────────────────────────────────
+  # Routes to the single TP SGLang instance.
+  # TP is transparent: Gateway sends standard HTTP, SGLang handles multi-GPU internally.
+  gateway:
+    image: unicoregpu2020/radixgates:latest
+    container_name: gateway
+    restart: unless-stopped
+    working_dir: /app/gateway
+    command:
+      - sh
+      - -c
+      - |
+        cat > /app/gateway/config/config.json <<EOF
+        {
+          "port": 8080,
+          "routing_mode": "direct",
+          "default_model": "$$MODEL_PATH",
+          "log_level": "info",
+          "max_concurrent_per_node": 8,
+          "sglang_instances": [
+            {"group": "tp", "role": "", "host": "sglang-tp", "port": 30000, "max_concurrent": 8}
+          ]
+        }
+        EOF
+        exec /usr/local/bin/sglang_gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      sglang-tp:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  hf_cache:
+
+# =============================================================================
+# Tensor Parallel (TP) Stack — RadixGates v0.2+
+#
+# ── What TP does ─────────────────────────────────────────────────────────────
+#
+#   TP splits a SINGLE model's weights across multiple GPUs.
+#   Each GPU holds a shard of every layer (attention heads + FFN columns).
+#   An All-Reduce synchronises activations after each layer.
+#   Result: one logical SGLang instance uses N×VRAM, so large models fit.
+#
+#   Contrast with PD (docker-compose.pd.yml):
+#     PD    — two separate SGLang processes, GPU 0 = prefill, GPU 1 = decode
+#     TP    — one SGLang process, GPU 0 + GPU 1 = same model, split by weight
+#
+# ── Why TP, not PD, for large models ─────────────────────────────────────────
+#
+#   Qwen2.5-14B fp16 ≈ 28 GB  → doesn't fit in a single 24 GB GPU.
+#   --tensor-parallel-size 2   → each GPU holds ~14 GB of weights → fits.
+#   PD would need the FULL model on EACH GPU → impossible without quantisation.
+#
+# ── Vast.ai machine recommendations ──────────────────────────────────────────
+#
+#   Goal: demonstrate TP (model REQUIRES multi-GPU to load)
+#
+#   Cheapest option — ~$0.8–1.2 /hr:
+#     Machine : 2× RTX 4090  (24 GB each, PCIe inter-GPU)
+#     Model   : Qwen/Qwen2.5-14B-Instruct  (28 GB fp16 — must use TP=2)
+#     Command : docker compose -f docker-compose.tp.yml up -d
+#
+#   Better throughput — ~$2–3 /hr:
+#     Machine : 2× A100 40 GB  (NVLink inter-GPU, much faster All-Reduce)
+#     Model   : Qwen/Qwen2.5-14B-Instruct  OR  meta-llama/Meta-Llama-3-70B-Instruct (AWQ 4-bit)
+#
+#   Maximum scale — ~$6–8 /hr:
+#     Machine : 4× A100 80 GB  (NVLink)
+#     Model   : meta-llama/Meta-Llama-3-70B-Instruct  (fp16, no quantisation)
+#     Command : MODEL_PATH=meta-llama/Meta-Llama-3-70B-Instruct TP_SIZE=4 ...
+#               (edit --tensor-parallel-size 4 in this file)
+#
+#   Why Qwen2.5-14B is the best entry-level TP demo model:
+#     - 28 GB fp16 → physically impossible to load on a single 24 GB GPU
+#     - TP=2 is the minimum; loading failure without it proves the requirement
+#     - Fast enough on RTX 4090 × 2 to give responsive latency numbers
+#
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#
+#   # Start stack
+#   docker compose -f docker-compose.tp.yml up -d
+#
+#   # Verify TP is active (tp_size field in response)
+#   curl http://localhost:30000/get_model_info | python3 -m json.tool
+#
+#   # Run demo / benchmark
+#   python3 examples/tp_demo.py
+#
+#   # Override model
+#   MODEL_PATH=meta-llama/Meta-Llama-3-70B-Instruct docker compose -f docker-compose.tp.yml up -d
+#
+# ── Architecture ──────────────────────────────────────────────────────────────
+#
+#   Client
+#     → RadixGates Gateway :8080  (prefix-hash routing, semaphore, /metrics)
+#     → SGLang TP instance :30000  (GPU 0 + GPU 1, All-Reduce across NVLink/PCIe)
+#          GPU 0: attention heads [0..H/2), FFN columns [0..F/2)
+#          GPU 1: attention heads [H/2..H), FFN columns [F/2..F)
+#
+# =============================================================================

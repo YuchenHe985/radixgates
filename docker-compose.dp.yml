@@ -1,0 +1,251 @@
+services:
+  # ── 4× SGLang instances — one per GPU (Data Parallel = 4) ───────────────────
+  #
+  # DP: each GPU runs a complete model replica.
+  # Gateway prefix-hash routes requests: same system prompt → same GPU → KV Cache hit.
+  # All 4 GPUs process different request batches simultaneously → 4× throughput.
+  #
+  # Default model: Qwen/Qwen2.5-14B-Instruct (28 GB fp16, fits in A100 80 GB)
+  # Override via MODEL_PATH env var.
+  #
+  # Alternative for 70B: use docker-compose.tp.yml with TP_SIZE=2, DP handled by
+  # running two such TP stacks and pointing Gateway at both.
+  sglang-dp-0:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-dp-0
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30000:30000"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL_PATH:-Qwen/Qwen2.5-14B-Instruct}
+        --port 30000
+        --host 0.0.0.0
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --enable-prefix-caching
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  sglang-dp-1:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-dp-1
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30001:30001"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL_PATH:-Qwen/Qwen2.5-14B-Instruct}
+        --port 30001
+        --host 0.0.0.0
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --enable-prefix-caching
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  sglang-dp-2:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-dp-2
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=2
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30002:30002"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL_PATH:-Qwen/Qwen2.5-14B-Instruct}
+        --port 30002
+        --host 0.0.0.0
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --enable-prefix-caching
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  sglang-dp-3:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-dp-3
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=3
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "30003:30003"
+    command: >
+      python3 -m sglang.launch_server
+        --model-path ${MODEL_PATH:-Qwen/Qwen2.5-14B-Instruct}
+        --port 30003
+        --host 0.0.0.0
+        --tensor-parallel-size 1
+        --mem-fraction-static 0.85
+        --enable-prefix-caching
+        --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+  # ── RadixGates Gateway — prefix-hash routes across all 4 DP nodes ───────────
+  #
+  # Routing logic (router.go consistent hash):
+  #   hash(system_prompt_prefix) % 4  → always picks the same GPU for same prefix
+  #   → KV Cache hit on repeat requests with the same system prompt
+  #
+  # Each node has its own semaphore (max_concurrent=16).
+  # If a node's slots are full, the request waits; it does NOT overflow to another node.
+  # This preserves cache locality at the cost of head-of-line blocking.
+  gateway:
+    image: unicoregpu2020/radixgates:latest
+    container_name: gateway
+    restart: unless-stopped
+    working_dir: /app/gateway
+    command:
+      - sh
+      - -c
+      - |
+        cat > /app/gateway/config/config.json <<EOF
+        {
+          "port": 8080,
+          "routing_mode": "direct",
+          "default_model": "$$MODEL_PATH",
+          "log_level": "info",
+          "max_concurrent_per_node": 16,
+          "sglang_instances": [
+            {"group": "dp", "role": "", "host": "sglang-dp-0", "port": 30000, "max_concurrent": 16},
+            {"group": "dp", "role": "", "host": "sglang-dp-1", "port": 30001, "max_concurrent": 16},
+            {"group": "dp", "role": "", "host": "sglang-dp-2", "port": 30002, "max_concurrent": 16},
+            {"group": "dp", "role": "", "host": "sglang-dp-3", "port": 30003, "max_concurrent": 16}
+          ]
+        }
+        EOF
+        exec /usr/local/bin/sglang_gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      sglang-dp-0:
+        condition: service_healthy
+      sglang-dp-1:
+        condition: service_healthy
+      sglang-dp-2:
+        condition: service_healthy
+      sglang-dp-3:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  hf_cache:
+
+# =============================================================================
+# Data Parallel (DP) Stack — RadixGates
+#
+# ── What DP does ─────────────────────────────────────────────────────────────
+#
+#   Each GPU runs a COMPLETE model replica independently.
+#   No inter-GPU communication during inference (zero All-Reduce / All-to-All).
+#   Gateway distributes requests across replicas via prefix-hash consistent hashing.
+#
+#   Result:
+#     4× request throughput (4 replicas process different batches in parallel)
+#     KV Cache locality preserved (same prefix → same GPU → cache hit)
+#     Single replica failure → Gateway stops routing to it (semaphore drains)
+#
+# ── DP vs TP vs EP ────────────────────────────────────────────────────────────
+#
+#   DP  — multiple complete copies, zero GPU-to-GPU communication
+#         scales QPS; requires model to fit in one GPU
+#
+#   TP  — one model split across GPUs, All-Reduce per layer
+#         scales model size; requires fast NVLink
+#
+#   EP  — Expert FFNs split across GPUs (MoE only), All-to-All per MoE layer
+#         scales Expert capacity; requires MoE model
+#
+# ── Hardware requirements (4× A100 80 GB) ────────────────────────────────────
+#
+#   Qwen/Qwen2.5-14B-Instruct (default):
+#     28 GB fp16 per replica × 4 = 112 GB total (fits easily in 4×80 GB)
+#     Each GPU: ~35% VRAM used → lots of headroom for KV Cache
+#
+#   To run 70B with DP: use TP=2 per DP group (2 GPUs per replica × 2 = 4 GPUs)
+#     → see docker-compose.tp.yml, run two instances on different port pairs
+#     → point Gateway at both TP instances
+#
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#
+#   # Start 4-replica DP stack
+#   docker compose -f docker-compose.dp.yml up -d
+#
+#   # Override model
+#   MODEL_PATH=Qwen/Qwen2.5-32B-Instruct docker compose -f docker-compose.dp.yml up -d
+#
+#   # Verify all 4 nodes healthy
+#   for port in 30000 30001 30002 30003; do
+#     echo "GPU $((port-30000)): $(curl -s http://localhost:$port/health)"
+#   done
+#
+#   # Run DP demo (routing distribution + cache hit verification)
+#   python3 examples/dp_demo.py
+#
+# ── Architecture ──────────────────────────────────────────────────────────────
+#
+#   Client
+#     → RadixGates Gateway :8080
+#         prefix_hash % 4
+#           → GPU 0 :30000  (full model replica, independent KV Cache)
+#           → GPU 1 :30001  (full model replica, independent KV Cache)
+#           → GPU 2 :30002  (full model replica, independent KV Cache)
+#           → GPU 3 :30003  (full model replica, independent KV Cache)
+#
+# =============================================================================

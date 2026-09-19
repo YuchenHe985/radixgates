@@ -1,0 +1,1 @@
+RadixAttention is a revolutionary approach by SGLang. It caches the KV state of the system prompts and document contexts using an efficient radix tree, making it incredibly fast for repeated similar prefixes.

@@ -1,0 +1,9 @@
+{
+  "port": 8080,
+  "default_model": "NousResearch/Meta-Llama-3-8B-Instruct",
+  "log_level": "info",
+  "max_concurrent_per_node": 8,
+  "sglang_instances": [
+    { "group": "local", "host": "127.0.0.1", "port": 30000, "max_concurrent": 8 }
+  ]
+}
