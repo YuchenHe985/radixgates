@@ -28,7 +28,7 @@ flowchart LR
 **Provenance.** The original gateway, its README and the deployment runbooks come from a project my mentor assigned (UnicoreGPU team); they
 are preserved in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
 is mine: `git diff upstream-snapshot`. Order of work: the real-GPU runs came first (2026-07-27, see [data](benchmarks/results/real_gpu/sglang_parallelism_runs.csv)),
-then the gateway upgrade and the failure-injection benchmark. Design and failure modes: [docs/RELIABILITY.md](docs/RELIABILITY.md).
+then the gateway upgrade and the failure-injection benchmark. Design and failure modes: [docs/RELIABILITY.md](docs/RELIABILITY.md). Running it (alerts, settings, troubleshooting): [docs/OPERATING.md](docs/OPERATING.md).
 
 ## Reference scenarios and what was tested
 
