@@ -96,15 +96,18 @@ func init() {
 	)
 }
 
-// RegisterRouter exposes per-node state (up, breaker, in-flight) and queue depth.
-// Call it once, from main, with the router built from the loaded config.
-func RegisterRouter(r *router.Router) {
+// RegisterRouter exposes per-node state (up, breaker, in-flight) and queue depth on the
+// default registry. Call it once, from main, with the router built from the loaded config.
+func RegisterRouter(r *router.Router) { RegisterRouterWith(prometheus.DefaultRegisterer, r) }
+
+// RegisterRouterWith is RegisterRouter for an explicit registry.
+func RegisterRouterWith(reg prometheus.Registerer, r *router.Router) {
 	snap := func(f func(router.Status) float64, i int) func() float64 {
 		return func() float64 { return f(r.Snapshot()[i]) }
 	}
 	for i, n := range r.Nodes() {
 		lbl := prometheus.Labels{"node": n.Name}
-		prometheus.MustRegister(
+		reg.MustRegister(
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "radixgates_node_up",
 				Help: "1 if the active health check considers the node up.", ConstLabels: lbl},
 				snap(func(s router.Status) float64 { return b2f(s.Up) }, i)),
@@ -116,7 +119,7 @@ func RegisterRouter(r *router.Router) {
 				snap(func(s router.Status) float64 { return float64(s.Inflight) }, i)),
 		)
 	}
-	prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "radixgates_queue_depth",
+	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "radixgates_queue_depth",
 		Help: "Requests waiting for a node slot."}, func() float64 { return float64(r.QueueDepth()) }))
 }
 

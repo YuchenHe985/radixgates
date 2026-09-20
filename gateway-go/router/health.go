@@ -48,6 +48,9 @@ func (r *Router) ProbeAll(ctx context.Context, h HealthOptions, client *http.Cli
 		go func(n *Node) {
 			defer wg.Done()
 			ok := probe(ctx, client, n.URL+h.Path, h.Timeout)
+			if ctx.Err() != nil {
+				return // shutting down: an aborted probe says nothing about the node
+			}
 			mu.Lock()
 			ps := state[n.Name]
 			if ps == nil {
