@@ -93,6 +93,8 @@ func setupDirectRoutes(ctx context.Context, mux *http.ServeMux, cfg *config.Conf
 	opts := router.Options{
 		BoundedLoadFactor: cfg.Routing.BoundedLoadFactor,
 		AffinityFloor:     cfg.Routing.AffinityFloor,
+		AffinityWait:      cfg.Routing.AffinityWait.Std(),
+		PlacementSize:     cfg.Routing.PlacementSize,
 		MaxQueue:          cfg.Admission.MaxQueue,
 		QueueTimeout:      cfg.Admission.QueueTimeout.Std(),
 		OnBreakerChange: func(node string, from, to breaker.State) {

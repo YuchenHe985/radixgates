@@ -48,6 +48,16 @@ type Routing struct {
 	// AffinityFloor is the minimum concurrency a node may hold before the bound
 	// applies, so that low traffic keeps its prefix affinity.
 	AffinityFloor int `json:"affinity_floor"`
+	// AffinityWait is how long a request waits for its preferred node when that node is only at its
+	// concurrency limit, before spilling to the next-ranked node. Zero spills immediately. Waiting
+	// keeps the prefix cache useful when a node's cache holds fewer prompts than the traffic uses.
+	AffinityWait Duration `json:"affinity_wait"`
+	// PlacementSize enables placement memory: the gateway remembers which node each prompt prefix was
+	// placed on (up to this many prefixes, least recently used forgotten first). A new prefix goes to the
+	// node holding the fewest prefixes, so a small set of hot prefixes is spread evenly instead of
+	// following the hash, and a prefix stays on its node until that node stops being available.
+	// Zero uses plain rendezvous hashing.
+	PlacementSize int `json:"placement_size"`
 }
 
 type Breaker struct {
@@ -145,6 +155,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Routing.AffinityFloor < 1 {
 		return fmt.Errorf("config: routing.affinity_floor must be >= 1")
+	}
+	if c.Routing.PlacementSize < 0 {
+		return fmt.Errorf("config: routing.placement_size must not be negative")
+	}
+	if c.Routing.AffinityWait < 0 {
+		return fmt.Errorf("config: routing.affinity_wait must not be negative")
 	}
 	r := c.Reliability
 	if r.MaxAttempts < 1 {

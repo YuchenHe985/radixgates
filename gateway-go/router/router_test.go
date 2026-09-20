@@ -268,3 +268,281 @@ func TestReleaseTwiceIsSafe(t *testing.T) {
 		t.Fatalf("inflight = %d", s.Inflight)
 	}
 }
+
+// A node's prefix cache only helps if the requests for that prefix keep arriving at the node. When the
+// preferred node is merely full, a request may wait for it for AffinityWait instead of spilling.
+func TestAffinityWaitHoldsForThePreferredNode(t *testing.T) {
+	o := opts()
+	o.AffinityWait = 500 * time.Millisecond
+	o.QueueTimeout = 2 * time.Second
+	r := newRouter(2, 1, o)
+	pref := r.Ranking("k")[0]
+	first := acquire(t, r, "k", nil)
+	if first.N.Name != pref {
+		t.Fatalf("first lease on %s, want the preferred node %s", first.N.Name, pref)
+	}
+	got := make(chan string, 1)
+	go func() {
+		l, err := r.Acquire(context.Background(), "k", "", nil, nil)
+		if err != nil {
+			got <- "error: " + err.Error()
+			return
+		}
+		got <- l.N.Name
+		l.Release()
+	}()
+	time.Sleep(60 * time.Millisecond) // the second request is now waiting for the preferred node
+	first.Release()
+	select {
+	case n := <-got:
+		if n != pref {
+			t.Fatalf("waiting request went to %s, want the preferred node %s", n, pref)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting request never got a node")
+	}
+}
+
+func TestAffinityWaitExpiresAndSpills(t *testing.T) {
+	o := opts()
+	o.AffinityWait = 80 * time.Millisecond
+	o.QueueTimeout = 2 * time.Second
+	r := newRouter(2, 1, o)
+	pref := r.Ranking("k")[0]
+	first := acquire(t, r, "k", nil)
+	defer first.Release()
+	start := time.Now()
+	l := acquire(t, r, "k", nil)
+	defer l.Release()
+	if l.N.Name == pref {
+		t.Fatal("second request should have spilled to the other node")
+	}
+	if d := time.Since(start); d < 60*time.Millisecond || d > time.Second {
+		t.Fatalf("spilled after %v, want about the affinity wait (80ms)", d)
+	}
+}
+
+func TestWithoutAffinityWaitAFullPreferredNodeSpillsAtOnce(t *testing.T) {
+	r := newRouter(2, 1, opts())
+	pref := r.Ranking("k")[0]
+	first := acquire(t, r, "k", nil)
+	defer first.Release()
+	start := time.Now()
+	l := acquire(t, r, "k", nil)
+	defer l.Release()
+	if l.N.Name == pref || time.Since(start) > 40*time.Millisecond {
+		t.Fatalf("expected an immediate spill to the other node, got %s after %v", l.N.Name, time.Since(start))
+	}
+}
+
+func TestAffinityWaitDoesNotHoldForADownNode(t *testing.T) {
+	o := opts()
+	o.AffinityWait = 5 * time.Second
+	r := newRouter(2, 1, o)
+	pref := r.Ranking("k")[0]
+	for _, n := range r.Nodes() {
+		if n.Name == pref {
+			n.SetUp(false)
+		}
+	}
+	start := time.Now()
+	l := acquire(t, r, "k", nil)
+	defer l.Release()
+	if l.N.Name == pref || time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("a down preferred node must not be waited for: got %s after %v", l.N.Name, time.Since(start))
+	}
+}
+
+func TestAffinityWaitStillObeysTheQueueTimeout(t *testing.T) {
+	o := opts()
+	o.AffinityWait = 5 * time.Second
+	o.QueueTimeout = 120 * time.Millisecond
+	r := newRouter(1, 1, o)
+	first := acquire(t, r, "k", nil)
+	defer first.Release()
+	start := time.Now()
+	_, err := r.Acquire(context.Background(), "k", "", nil, nil)
+	if !errors.Is(err, ErrQueueTimeout) {
+		t.Fatalf("got %v, want ErrQueueTimeout", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("queue timeout took %v", d)
+	}
+	if r.QueueDepth() != 0 {
+		t.Fatalf("queue depth %d after the timeout, want 0", r.QueueDepth())
+	}
+}
+
+// The hot-spot bound still wins: a preferred node that is over its bounded-load limit is not waited for.
+func TestAffinityWaitDoesNotHoldAHotKeyPastTheLoadBound(t *testing.T) {
+	o := opts()
+	o.BoundedLoadFactor = 1
+	o.AffinityFloor = 1
+	o.AffinityWait = 5 * time.Second
+	r := newRouter(2, 1, o)
+	pref := r.Ranking("k")[0]
+	first := acquire(t, r, "k", nil)
+	defer first.Release()
+	start := time.Now()
+	l := acquire(t, r, "k", nil)
+	defer l.Release()
+	if l.N.Name == pref || time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("a key over the load bound must spill at once: got %s after %v", l.N.Name, time.Since(start))
+	}
+}
+
+// Placement memory: a small set of hot prefixes should be spread evenly over the nodes and then stay put,
+// instead of following the hash (which can put most of them on one node).
+func placementOpts() Options {
+	o := opts()
+	o.PlacementSize = 64
+	return o
+}
+
+func nodeByName(r *Router, name string) *Node {
+	for _, n := range r.Nodes() {
+		if n.Name == name {
+			return n
+		}
+	}
+	return nil
+}
+
+func placed(r *Router, name string) int {
+	for _, s := range r.Snapshot() {
+		if s.Name == name {
+			return s.Placed
+		}
+	}
+	return -1
+}
+
+func TestPlacementSpreadsNewPrefixesEvenlyAndKeepsThemThere(t *testing.T) {
+	o := placementOpts()
+	o.PlacementSize = 64
+	r := newRouter(3, 4, o)
+	first := map[string]string{}
+	for i := 0; i < 30; i++ { // plain hashing would spread 30 keys unevenly over 3 nodes
+		key := fmt.Sprintf("prompt-%d", i)
+		l := acquire(t, r, key, nil)
+		first[key] = l.N.Name
+		l.Release()
+	}
+	for _, s := range r.Snapshot() {
+		if s.Placed != 10 {
+			t.Fatalf("node %s holds %d prefixes, want 10 each: %+v", s.Name, s.Placed, r.Snapshot())
+		}
+	}
+	for round := 0; round < 5; round++ {
+		for key, node := range first {
+			l := acquire(t, r, key, nil)
+			if l.N.Name != node {
+				t.Fatalf("%s moved from %s to %s", key, node, l.N.Name)
+			}
+			l.Release()
+		}
+	}
+}
+
+func TestPlacementMovesAKeyWhenItsNodeIsDownAndKeepsItThereAfterRecovery(t *testing.T) {
+	r := newRouter(3, 4, placementOpts())
+	l := acquire(t, r, "k", nil)
+	x := l.N.Name
+	l.Release()
+	nodeByName(r, x).SetUp(false)
+	l = acquire(t, r, "k", nil)
+	y := l.N.Name
+	l.Release()
+	if y == x {
+		t.Fatal("a key must leave a node that is down")
+	}
+	nodeByName(r, x).SetUp(true)
+	l = acquire(t, r, "k", nil)
+	defer l.Release()
+	if l.N.Name != y {
+		t.Fatalf("the key went back to %s after recovery, want it to stay on %s", l.N.Name, y)
+	}
+	if placed(r, x) != 0 || placed(r, y) != 1 {
+		t.Fatalf("placement counts wrong after the move: %+v", r.Snapshot())
+	}
+}
+
+func TestPlacementSurvivesARetryOnAnotherNode(t *testing.T) {
+	r := newRouter(3, 4, placementOpts())
+	l := acquire(t, r, "k", nil)
+	x := l.N.Name
+	l.Release()
+	l = acquire(t, r, "k", map[string]struct{}{x: {}}) // the attempt on x failed and is retried elsewhere
+	if l.N.Name == x {
+		t.Fatal("the retry must avoid the excluded node")
+	}
+	l.Release()
+	l = acquire(t, r, "k", nil)
+	defer l.Release()
+	if l.N.Name != x || placed(r, x) != 1 {
+		t.Fatalf("a retry must not move the placement: back on %s, counts %+v", l.N.Name, r.Snapshot())
+	}
+}
+
+func TestPlacementIsNotMovedByASpill(t *testing.T) {
+	r := newRouter(2, 1, placementOpts())
+	first := acquire(t, r, "k", nil)
+	x := first.N.Name
+	spilled := acquire(t, r, "k", nil) // x is full, so this request spills to the other node
+	if spilled.N.Name == x {
+		t.Fatal("expected a spill")
+	}
+	first.Release()
+	spilled.Release()
+	l := acquire(t, r, "k", nil)
+	defer l.Release()
+	if l.N.Name != x || placed(r, x) != 1 {
+		t.Fatalf("after a spill the key must stay on %s: got %s, counts %+v", x, l.N.Name, r.Snapshot())
+	}
+}
+
+func TestPlacementForgetsTheLeastRecentlyUsedPrefix(t *testing.T) {
+	o := opts()
+	o.PlacementSize = 2
+	r := newRouter(3, 4, o)
+	for _, key := range []string{"a", "b", "c", "a", "d"} {
+		l := acquire(t, r, key, nil)
+		l.Release()
+		total := 0
+		for _, s := range r.Snapshot() {
+			total += s.Placed
+		}
+		if total > 2 {
+			t.Fatalf("%d prefixes remembered after %q, limit is 2", total, key)
+		}
+	}
+}
+
+func TestPlacementWorksWithTheAffinityWait(t *testing.T) {
+	o := placementOpts()
+	o.AffinityWait = 500 * time.Millisecond
+	o.QueueTimeout = 2 * time.Second
+	r := newRouter(2, 1, o)
+	first := acquire(t, r, "k", nil)
+	x := first.N.Name
+	got := make(chan string, 1)
+	go func() {
+		l, err := r.Acquire(context.Background(), "k", "", nil, nil)
+		if err != nil {
+			got <- "error: " + err.Error()
+			return
+		}
+		got <- l.N.Name
+		l.Release()
+	}()
+	time.Sleep(60 * time.Millisecond)
+	first.Release()
+	select {
+	case n := <-got:
+		if n != x {
+			t.Fatalf("waiting request went to %s, want the placed node %s", n, x)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting request never got a node")
+	}
+}

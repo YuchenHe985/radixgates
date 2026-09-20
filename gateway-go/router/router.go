@@ -17,6 +17,7 @@ package router
 
 import (
 	"cmp"
+	"container/list"
 	"context"
 	"errors"
 	"hash/fnv"
@@ -38,6 +39,9 @@ var (
 	ErrQueueTimeout = errors.New("timed out waiting for node capacity")
 
 	errAtCapacity = errors.New("all available nodes at capacity")
+	// errPreferredBusy means the top-ranked node is at its concurrency limit and the request should
+	// wait for it (see Options.AffinityWait) instead of spilling to another node.
+	errPreferredBusy = errors.New("preferred node at capacity")
 )
 
 // Node represents one SGLang inference server.
@@ -50,6 +54,7 @@ type Node struct {
 
 	nameHash uint64
 	inflight int // guarded by Router.mu
+	placed   int // prefixes currently placed on this node, guarded by Router.mu
 	up       atomic.Bool
 	br       *breaker.Breaker // nil when the breaker is disabled
 }
@@ -77,6 +82,8 @@ func (n *Node) allow() (breaker.Ticket, bool) {
 type Options struct {
 	BoundedLoadFactor float64
 	AffinityFloor     int
+	AffinityWait      time.Duration // how long to wait for a full preferred node before spilling; 0 spills at once
+	PlacementSize     int           // prompt prefixes remembered per (group, prefix); 0 disables placement memory
 	MaxQueue          int
 	QueueTimeout      time.Duration
 	Breaker           *breaker.Config                           // nil disables circuit breaking
@@ -91,6 +98,14 @@ type Router struct {
 	mu      sync.Mutex
 	notify  chan struct{} // closed and replaced on every release (broadcast)
 	waiting int
+
+	placeMap map[uint64]*list.Element // placement key -> element of placeLRU, guarded by mu
+	placeLRU *list.List               // *placement, most recently used first
+}
+
+type placement struct {
+	key  uint64
+	node *Node
 }
 
 // New builds a Router from the gateway config.
@@ -121,7 +136,12 @@ func New(instances []config.SGLangInstance, defaultMaxConcurrent int, opts Optio
 		log.Printf("[Router] Node registered: group=%q role=%q url=%s max_concurrent=%d", n.Group, n.Role, n.URL, mc)
 		nodes = append(nodes, n)
 	}
-	return &Router{opts: opts, nodes: nodes, notify: make(chan struct{})}
+	r := &Router{opts: opts, nodes: nodes, notify: make(chan struct{})}
+	if opts.PlacementSize > 0 {
+		r.placeMap = make(map[uint64]*list.Element)
+		r.placeLRU = list.New()
+	}
+	return r
 }
 
 func hostPort(host string, port int) string { return host + ":" + strconv.Itoa(port) }
@@ -177,11 +197,12 @@ func (r *Router) Acquire(ctx context.Context, prefixHash, targetGroup string, fi
 	}
 	kh := hashString(prefixHash)
 	queued := false
-	var deadline <-chan time.Time
+	var deadline, affinity <-chan time.Time
+	hold := r.opts.AffinityWait > 0 // keep waiting for the preferred node until the affinity wait ends
 
 	r.mu.Lock()
 	for {
-		l, err := r.tryPickLocked(kh, targetGroup, filter, exclude)
+		l, err := r.tryPickLocked(kh, targetGroup, filter, exclude, hold)
 		if err == nil {
 			if queued {
 				r.waiting--
@@ -189,7 +210,7 @@ func (r *Router) Acquire(ctx context.Context, prefixHash, targetGroup string, fi
 			r.mu.Unlock()
 			return l, nil
 		}
-		if err != errAtCapacity {
+		if err != errAtCapacity && err != errPreferredBusy {
 			if queued {
 				r.waiting--
 			}
@@ -207,11 +228,18 @@ func (r *Router) Acquire(ctx context.Context, prefixHash, targetGroup string, fi
 			defer t.Stop()
 			deadline = t.C
 		}
+		if err == errPreferredBusy && affinity == nil {
+			t := time.NewTimer(r.opts.AffinityWait)
+			defer t.Stop()
+			affinity = t.C
+		}
 		ch := r.notify
 		r.mu.Unlock()
 
 		select {
 		case <-ch:
+		case <-affinity:
+			hold, affinity = false, nil
 		case <-deadline:
 			r.mu.Lock()
 			r.waiting--
@@ -241,7 +269,8 @@ func (r *Router) tryLeaseLocked(n *Node) (*Lease, bool) {
 	return &Lease{N: n, t: t, r: r}, true
 }
 
-func (r *Router) tryPickLocked(kh uint64, group string, filter func(*Node) bool, exclude map[string]struct{}) (*Lease, error) {
+func (r *Router) tryPickLocked(kh uint64, group string, filter func(*Node) bool, exclude map[string]struct{},
+	holdForPreferred bool) (*Lease, error) {
 	cands := make([]scored, 0, len(r.nodes))
 	total := 0
 	for _, n := range r.nodes {
@@ -261,17 +290,29 @@ func (r *Router) tryPickLocked(kh uint64, group string, filter func(*Node) bool,
 		return nil, ErrNoNode
 	}
 	slices.SortFunc(cands, func(x, y scored) int { return cmp.Compare(y.s, x.s) })
+	if r.opts.PlacementSize > 0 {
+		// The placed node (or, for a new prefix, the node holding the fewest prefixes) becomes the
+		// preferred node; the rest keep their rendezvous order as the spill order.
+		if i := r.placeLocked(mix64(kh^hashString(group)), cands, exclude); i > 0 {
+			moved := cands[i]
+			copy(cands[1:i+1], cands[:i])
+			cands[0] = moved
+		}
+	}
 
 	limit := int(math.Ceil(r.opts.BoundedLoadFactor * float64(total+1) / float64(len(cands))))
 	limit = max(limit, r.opts.AffinityFloor)
 
 	denied := false
-	for _, c := range cands {
+	for i, c := range cands {
 		if c.n.inflight < min(c.n.MaxConcurrent, limit) {
 			if l, ok := r.tryLeaseLocked(c.n); ok {
 				return l, nil
 			}
 			denied = true
+		} else if i == 0 && holdForPreferred && c.n.inflight >= c.n.MaxConcurrent && c.n.inflight < limit {
+			// The preferred node is full but not over the hot-spot bound: wait for a slot on it.
+			return nil, errPreferredBusy
 		}
 	}
 	// Preferred nodes are over their bounded-load limit: spill to the least loaded.
@@ -291,6 +332,63 @@ func (r *Router) tryPickLocked(kh uint64, group string, filter func(*Node) bool,
 		return nil, ErrNoNode // breaker refused between Available() and Allow()
 	}
 	return nil, errAtCapacity
+}
+
+// placeLocked returns the index in cands of the node this placement key should go to and records the
+// placement. A key stays where it is placed while that node is a candidate. If its node is only excluded
+// because this request already failed there, another node serves the retry and the placement is kept; if
+// its node is unavailable the key moves to the node holding the fewest keys. Caller holds r.mu.
+func (r *Router) placeLocked(key uint64, cands []scored, exclude map[string]struct{}) int {
+	if el, ok := r.placeMap[key]; ok {
+		e := el.Value.(*placement)
+		for i, c := range cands {
+			if c.n == e.node {
+				r.placeLRU.MoveToFront(el)
+				return i
+			}
+		}
+		if _, excluded := exclude[e.node.Name]; excluded && e.node.available() {
+			return leastPlaced(cands)
+		}
+	}
+	best := leastPlaced(cands)
+	r.setPlacementLocked(key, cands[best].n)
+	return best
+}
+
+// leastPlaced picks the candidate holding the fewest placed keys, then the fewest in flight; ties keep
+// the better rendezvous rank because cands is sorted.
+func leastPlaced(cands []scored) int {
+	best := 0
+	for i := 1; i < len(cands); i++ {
+		a, b := cands[i].n, cands[best].n
+		if a.placed < b.placed || (a.placed == b.placed && a.inflight < b.inflight) {
+			best = i
+		}
+	}
+	return best
+}
+
+func (r *Router) setPlacementLocked(key uint64, n *Node) {
+	if el, ok := r.placeMap[key]; ok {
+		e := el.Value.(*placement)
+		if e.node != n {
+			e.node.placed--
+			n.placed++
+			e.node = n
+		}
+		r.placeLRU.MoveToFront(el)
+		return
+	}
+	r.placeMap[key] = r.placeLRU.PushFront(&placement{key: key, node: n})
+	n.placed++
+	for r.placeLRU.Len() > r.opts.PlacementSize {
+		last := r.placeLRU.Back()
+		e := last.Value.(*placement)
+		e.node.placed--
+		delete(r.placeMap, e.key)
+		r.placeLRU.Remove(last)
+	}
 }
 
 // Ranking returns node names ordered by rendezvous score for key (health ignored).
@@ -317,6 +415,7 @@ type Status struct {
 	Breaker  string `json:"breaker"`
 	Inflight int    `json:"inflight"`
 	Max      int    `json:"max_concurrent"`
+	Placed   int    `json:"placed_prefixes"`
 }
 
 func (r *Router) Snapshot() []Status {
@@ -324,7 +423,7 @@ func (r *Router) Snapshot() []Status {
 	defer r.mu.Unlock()
 	out := make([]Status, len(r.nodes))
 	for i, n := range r.nodes {
-		out[i] = Status{n.Name, n.Group, n.Role, n.Up(), n.BreakerState().String(), n.inflight, n.MaxConcurrent}
+		out[i] = Status{n.Name, n.Group, n.Role, n.Up(), n.BreakerState().String(), n.inflight, n.MaxConcurrent, n.placed}
 	}
 	return out
 }
