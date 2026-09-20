@@ -1,0 +1,33 @@
+{
+  "label": "brownout-original",
+  "url": "http://127.0.0.1:18080/v1/chat",
+  "clients": 16,
+  "prefixes": 12,
+  "max_tokens": 16,
+  "duration_s": 30.824351041,
+  "total": 458,
+  "ok": 458,
+  "failed": 0,
+  "success_rate": 1,
+  "retried_requests": 0,
+  "requests_per_second": 14.858382562241337,
+  "latency_ms_ok_only": {
+    "count": 458,
+    "mean": 1061.1337554585155,
+    "p50": 598.812,
+    "p95": 3463.96,
+    "p99": 11791.757,
+    "max": 12611.715
+  },
+  "ttft_ms_ok_only": {
+    "count": 458,
+    "mean": 668.2857467248909,
+    "p50": 113.084,
+    "p95": 3051.948,
+    "p99": 11283.127,
+    "max": 12110.803
+  },
+  "status_counts": {
+    "200": 458
+  }
+}

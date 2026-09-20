@@ -1,0 +1,33 @@
+{
+  "label": "crash-upgraded",
+  "url": "http://127.0.0.1:18080/v1/chat",
+  "clients": 16,
+  "prefixes": 12,
+  "max_tokens": 16,
+  "duration_s": 30.403425209,
+  "total": 1202,
+  "ok": 1198,
+  "failed": 4,
+  "success_rate": 0.9966722129783694,
+  "retried_requests": 1,
+  "requests_per_second": 39.53501922027472,
+  "latency_ms_ok_only": {
+    "count": 1198,
+    "mean": 402.25844657762923,
+    "p50": 379.227,
+    "p95": 608.552,
+    "p99": 615.707,
+    "max": 650.185
+  },
+  "ttft_ms_ok_only": {
+    "count": 1198,
+    "mean": 88.50001252086803,
+    "p50": 76.35,
+    "p95": 176.181,
+    "p99": 178.135,
+    "max": 212.368
+  },
+  "status_counts": {
+    "200": 1202
+  }
+}

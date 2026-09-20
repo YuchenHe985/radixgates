@@ -1,0 +1,9 @@
+date_utc:   2026-09-19T23:45:10Z
+machine:    Darwin arm64
+cpu:        Apple M1
+go:         go version go1.27.1 darwin/arm64
+original:   git tag upstream-snapshot (a3c0d3e)
+upgraded:   2b63e2b
+scenario:   crash (fault at 8s, recover at 20s, duration 30s, clients 16)
+workers:    4 simulated (ttft cold 100ms / warm 50ms, tpot 15ms, 16 tokens, capacity 4, prefix cache 4)
+NOTE:       workers are simulated; numbers describe gateway behaviour, not GPU performance.
