@@ -34,7 +34,16 @@ sequenceDiagram
   formula in `router_test.go`), discarding warm caches on healthy nodes. Rendezvous ranking moves only the lost node's keys.
 - **Bounded load.** A node may hold at most `ceil(bounded_load_factor x (in-flight + 1) / candidates)` requests (never below `affinity_floor`);
   beyond that a request spills to the next-ranked node. A cache miss is usually cheaper than queueing behind a saturated GPU. The floor keeps
-  affinity at low traffic, where the bound would otherwise be 1.
+  affinity at low traffic, where the bound would otherwise be 1. A node that is merely at its concurrency limit also spills unless
+  `affinity_wait` is set, see below.
+- **Affinity wait.** With `routing.affinity_wait` set, a request whose preferred node is full (but not over the bound) waits for it, up to that
+  long, before spilling. The wait counts against the bounded admission queue and its timeout, and a node that is down or over the bound is never
+  waited for. Measured on real llama.cpp workers with a small cache, spilling at once cut prefix-cache hits from 59% to 24%
+  ([README](../README.md#real-inference-engines-prefix-cache-behaviour-under-each-routing-policy)).
+- **Placement memory.** With `routing.placement_size` set, the router remembers which node each (group, prefix) is placed on. A new prefix goes to the
+  node holding the fewest prefixes (then the fewest in flight, then the best rendezvous rank), and stays there until that node is unavailable, when it
+  moves once and does not return on recovery. A retry that excludes the placed node uses another node without moving the placement, and a spill
+  does not move it either. Least recently used prefixes are forgotten beyond the size. This avoids the skew of hashing a few hot prefixes onto a few nodes.
 - **First-byte commit.** A retry is only safe while the client has received nothing, so the handler reads the first upstream chunk before writing
   any header or byte. Before that point: refused connection, first-token timeout, 5xx, or a stream that dies with no output are retried on
   another node. After it: the client gets `upstream_interrupted` and the breaker is charged; a non-SSE body is aborted so a truncated response

@@ -10,7 +10,7 @@ bounded retries, load-aware routing, admission control) measured against the ori
 - **Routing under node loss.** Losing 1 of 4 nodes remaps **0%** of the surviving nodes' prefix keys (rendezvous hashing), versus **75.3%** with the original `hash % N`.
 - **Node crash.** Clean completions **85.2% -> 99.7%**. **Gray failure** (`/health` green, inference hung): P99 **11.8 s -> 0.6 s**. Same config, same load, the original built from tag `upstream-snapshot`.
 - **No duplicated output.** A request is retried only before its first byte reaches the client; a stream that breaks mid-way ends with an explicit `upstream_interrupted` event.
-- **41 tests under `go test -race`** (40 added): circuit-breaker state machine, routing, active health probes, admission queue, metrics, and handler integration tests against workers that crash, hang, reset connections and fail mid-stream.
+- **53 tests under `go test -race`** (52 added): circuit-breaker state machine, routing, active health probes, admission queue, metrics, and handler integration tests against workers that crash, hang, reset connections and fail mid-stream.
 - **Real hardware.** The same DP / TP / EP test matrix on 4x RTX 4090 (PCIe) and 4x A100 (NVLink), plus PD disaggregation on the 4090 machine; 8 deployment failures root-caused (CUDA image vs driver, removed SGLang flags, NCCL initialisation in Docker, 40 GB OOM, a wedged GPU).
 
 ```mermaid
@@ -58,7 +58,7 @@ gap between columns is not attributable to interconnect alone ([docs/real-gpu-re
 | Streams that break mid-way | Truncated silently | Client receives an explicit `upstream_interrupted` event; the breaker is charged |
 | Observability | 3 metrics, request histogram capped at 1 s | + upstream attempts by node and result, retries by reason, breaker transitions, mid-stream failures, time to first byte, queue wait, per-node up / breaker / in-flight gauges, `/readyz`, `/admin/nodes` |
 | HTTP client | A new `http.Client` per request | One shared client with connection pooling |
-| Tests | 1 (prefix hash) | 40 more: breaker state machine, router (affinity, remap, bounded load, queue), active health probes, config, metrics, and handler integration tests against fault-injecting workers, all under `go test -race` |
+| Tests | 1 (prefix hash) | 52 more: breaker state machine, router (affinity, remap, bounded load, queue), active health probes, config, metrics, and handler integration tests against fault-injecting workers, all under `go test -race` |
 | Config | JSON | Same file works unchanged; new optional `routing`, `reliability`, `admission` blocks |
 
 Endpoints, config keys, the PD `role` and `group` semantics and the Docker/compose files are unchanged.
@@ -103,6 +103,43 @@ Read these numbers carefully:
 
 Raw data: `benchmarks/results/sim/<scenario>/<original|upgraded>/{requests.csv,summary.json,metrics.prom}`.
 
+## Real inference engines: prefix-cache behaviour under each routing policy
+
+The failure benchmark above uses simulated workers. To see routing against a real engine, `benchmarks/real_engine/run_real.py` starts three
+[llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` workers (Qwen2.5-0.5B, two slots each, Apple M1) and sends 120 requests that share
+six long system prompts (a database schema followed by a question) through each policy, with all KV caches erased before every run. It reads the
+number of prompt tokens each request took from the KV cache (`cached_tokens`) and how many prompt tokens each worker evaluated. Median of 3 runs.
+This measures how routing changes cache behaviour on a real engine; it is not a GPU benchmark.
+
+**Cache capacity limited to the slots** (`--cache-ram 0`; the working set of six prefixes is as large as the six slots, as when KV memory is the limit):
+
+| Policy | Prompt tokens from cache | Requests/s | Latency p50 / p95 | Share of prefill work on the busiest worker |
+| --- | ---: | ---: | --- | ---: |
+| original (`hash % N`, queues when the node is full) | 59.1% | 3.13 | 1.70 / 4.53 s | 73% |
+| upgraded, spills to the next node when full | 24.4% | 1.80 | 3.08 / 5.25 s | 44% |
+| upgraded + placement memory + affinity wait (10 s) | 61.5% | 3.40 | 1.52 / 5.07 s | 43% |
+| round-robin, no gateway | 22.0% | 1.68 | 3.36 / 6.40 s | 35% |
+
+**llama.cpp's default** keeps evicted prompts in a host-memory cache (`--cache-ram`, 8 GiB), so any worker can restore any prefix cheaply. Every policy
+then reaches 95-98% cache hits and the differences are small (requests/s: original 9.3, upgraded 10.8, upgraded + placement + wait 10.6, round-robin 9.6).
+
+What this showed:
+
+- **Spilling when the preferred node is full is wrong when a cache holds few prefixes.** The upgraded gateway's original rule sent a request to the
+  next-ranked node the moment its preferred node was full, which scatters one prefix over several nodes and evicts it everywhere: 24% cache hits
+  against 59% for the original, which queues. The original does not balance load either: three quarters of the prefill work landed on one worker,
+  because six prompts hashed onto three nodes unevenly.
+- **Placement memory (`routing.placement_size`)** sends a new prefix to the node holding the fewest prefixes and keeps it there until that node is down,
+  which removes the hash skew. **`routing.affinity_wait`** makes a request wait for a full preferred node instead of spilling. Together they reach the
+  original's cache hit rate (61.5% median; runs 61.5%, 60.6% and 68.5% against 62.2%, 59.1% and 58.3% for the original, so the two are
+  indistinguishable here) while spreading the work. Either one alone did not: placement without waiting gave 19.7%, waiting without placement 45.7%
+  with one worker idle.
+- **Limits.** One machine, three runs, a 0.5B model whose prefill is slow because three servers share one GPU, and six prefixes. Whether waiting beats
+  spilling depends on the ratio of a cache miss to queueing time; with a fast prefill on a large GPU the balance shifts toward spilling. Both options
+  are off by default (`placement_size` 0, `affinity_wait` 0), so existing configs behave as before.
+
+Raw data: `benchmarks/results/real_engine_limited_cache/` and `real_engine_default_cache/`.
+
 ## My multi-GPU evaluation of the original (real hardware)
 
 Before the changes above I ran the delivered RadixGates on rented 4x RTX 4090 (PCIe) and 4x A100-SXM4-40GB (NVLink) machines in DP=4,
@@ -117,7 +154,7 @@ diagnoser and a confounder-aware benchmark comparison.
 ## Try it
 
 ```bash
-make test                                       # vet + 41 tests under -race
+make test                                       # vet + 53 tests under -race
 make bench                                      # original vs upgraded, crash and gray failure, ~2 min (needs go, curl, python3)
 make plots                                      # needs matplotlib
 
@@ -130,7 +167,7 @@ Optional config (defaults shown; everything is optional):
 
 ```json
 {
-  "routing":     { "bounded_load_factor": 1.25, "affinity_floor": 4 },
+  "routing":     { "bounded_load_factor": 1.25, "affinity_floor": 4, "affinity_wait": "0s", "placement_size": 0 },
   "reliability": { "max_attempts": 3, "attempt_timeout": "15s", "stream_idle_timeout": "30s",
                    "breaker": { "enabled": true, "failure_threshold": 5, "open_duration": "5s" },
                    "health":  { "enabled": true, "interval": "2s", "path": "/health" } },
