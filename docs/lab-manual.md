@@ -60,7 +60,7 @@ docker build -t unicoregpu2020/radixgates:latest .
 pip install requests
 ```
 
-> Vast.ai 等禁用 Docker 桥接网络的容器，改用**裸机 no-Docker 路径**：用 `tmux` 直接起 SGLang，`cd gateway-go && go build -o /usr/local/bin/sglang_gateway .` 编译网关。完整 runbook 见 `agents/deployment/agent.md`。
+> Vast.ai 等禁用 Docker 桥接网络的容器，改用**裸机 no-Docker 路径**：用 `tmux` 直接起 SGLang，`cd gateway-go && go build -o /usr/local/bin/sglang_gateway .` 编译网关。排障手册见 `docs/troubleshooting/`。
 
 ### 1.3 模型下载
 - SGLang 会自动从 HuggingFace 拉模型；**Llama 系列是 gated**，需要先 `huggingface-cli login` 或设 `HF_TOKEN`。
@@ -331,7 +331,7 @@ README 那张表是这样对齐的（**4× RTX 4090 PCIe** vs **4× A100 SXM NVL
 | SGLang OOM / 起不来 | 模型太大装不下：调低 `--mem-fraction-static`（如 0.80），或换更小模型 / 上 TP |
 | 端口冲突 | 30000/8080/9000 被占：`docker compose down` 清理，或改端口映射 |
 | `/health` 连不上 | SGLang 还在加载模型（大模型要几分钟）；等健康检查通过再跑 demo |
-| 更多失败模式 | 见 `agents/deployment/skills/`（nvidia-docker、端口冲突、KV 传输后端等专项修复） |
+| 更多失败模式 | 见 `docs/troubleshooting/`（nvidia-docker、端口冲突、KV 传输后端等专项修复） |
 
 ---
 

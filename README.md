@@ -1,367 +1,139 @@
-# RadixGates — High-Performance Private LLM Inference Gateway
+# RadixGates: a failure-tolerant gateway for multi-GPU LLM serving
 
-**Prefix-Aware Routing · PD Disaggregation · Data / Tensor / Expert Parallelism · Direct SSE Streaming · Semaphore Backpressure · Prometheus Metrics**
+[![ci](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml/badge.svg)](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml)
 
----
+RadixGates is a Go gateway in front of SGLang. It routes each request by its system-prompt prefix so a node's KV cache is reused,
+and spreads load across data-parallel replicas and prefill/decode nodes. This repository has three parts: the delivered project,
+my multi-GPU evaluation of it on 4x RTX 4090 and 4x A100 machines, and a reliability upgrade (health-aware failover, circuit breaking,
+bounded retries, load-aware routing, admission control) measured against the original under injected faults.
 
-## What Is This?
+- **Routing under node loss.** Losing 1 of 4 nodes remaps **0%** of the surviving nodes' prefix keys (rendezvous hashing), versus **75.3%** with the original `hash % N`.
+- **Node crash.** Clean completions **85.2% -> 99.7%**. **Gray failure** (`/health` green, inference hung): P99 **11.8 s -> 0.6 s**. Same config, same load, the original built from tag `upstream-snapshot`.
+- **No duplicated output.** A request is retried only before its first byte reaches the client; a stream that breaks mid-way ends with an explicit `upstream_interrupted` event.
+- **41 tests under `go test -race`** (40 added): circuit-breaker state machine, routing, active health probes, admission queue, metrics, and handler integration tests against workers that crash, hang, reset connections and fail mid-stream.
+- **Real hardware.** The same DP / TP / EP test matrix on 4x RTX 4090 (PCIe) and 4x A100 (NVLink), plus PD disaggregation on the 4090 machine; 8 deployment failures root-caused (CUDA image vs driver, removed SGLang flags, NCCL initialisation in Docker, 40 GB OOM, a wedged GPU).
 
-RadixGates is an **enterprise-grade private LLM deployment platform** built to solve a core problem in large-scale internal AI deployments:
-
-> How do you serve hundreds of concurrent employees through a private LLM without exposing data to public APIs, dropping requests, or wasting GPU compute?
-
-It sits in front of SGLang inference engines and provides:
-
-1. **Multi-GPU Parallelism** — DP / TP / EP each targeting a different bottleneck; mix and stack as model size and QPS demand grows
-2. **PD Disaggregation** — Prefill (compute-intensive) and Decode (memory-bandwidth-intensive) run on separate GPUs, removing resource contention
-3. **Prefix-Aware Routing** — SHA-256 fingerprint routes same-context requests to the same node; SGLang's RadixAttention keeps the KV Cache hot
-4. **Semaphore Backpressure** — Go semaphore limits concurrent load per node; excess requests wait in goroutines with zero message loss
-5. **Direct SSE Streaming** — Token-by-token streaming from Gateway to client, no intermediate broker
-
-**Typical use case**: 中大型企业内部私有部署 — 员工通过企业内网访问 LLM，网关保证数据不出内网、GPU 不被打爆、请求零丢失。
-
----
-
-## Benchmark Results
-
-### Multi-GPU Parallel Modes — Two Hardware Platforms Verified
-
-**4× RTX 4090 PCIe** (SGLang 0.5.10, 2026-04-26) vs **4× A100 SXM NVLink** (SGLang 0.5.10.post1, 2026-04-27)
-
-| Mode | Model | Success | P50 4090 PCIe | P50 A100 NVLink | NVLink Speedup |
-|------|-------|---------|--------------|----------------|---------------|
-| **DP=4** | Llama-3-8B | **40/40 ✅** | 1174ms | **764ms** | **1.5×** |
-| **TP=4** | Qwen2.5-32B | **20/20 ✅** | 3851ms | **2422ms** | **1.6×** |
-| **EP=4** | Qwen1.5-MoE-A2.7B | **20/20 ✅** | 1099ms | **827ms** | **1.3×** |
-
-Key confirmations: `tensor_parallel_size=4`, `[TP0 EP0]~[TP3 EP3]` EP ranks, prefix-hash KV cache routing.
-
-Full results: [`docs/benchmark_parallel_modes.md`](docs/benchmark_parallel_modes.md)
-
-### PD Disaggregation (2× RTX 4090, verified 2026-04-25)
-
-| Metric | Result |
-|--------|--------|
-| 30-concurrent stress test | **30/30, 0 failures** |
-| Total time for 30 concurrent requests | **5.2 s** |
-| P50 latency | **2.8 s** |
-| P95 latency | **5.2 s** |
-| RadixCache hit TTFT (7720-token context) | **82 ms** |
-| Cold TTFT (no cache) | **861 ms** |
-| Prefix-cache speedup | **10.5× 🚀** |
-
----
-
-## Parallelism Strategy
-
-```
-模型放得进单卡?
-  ├─ YES → DP=N  (多副本, 线性扩 QPS, 零跨卡通信)
-  └─ NO  → TP=N  (权重切分, All-Reduce 每层)
-               └─ MoE 模型? → +EP=N (Expert 切分, All-to-All)
-                                └─ 超长流水线? → +PP (层间切分)
-
-工业实践: DP + TP + EP 叠加 (DeepSeek-V3 / Qwen3-235B 等)
+```mermaid
+flowchart LR
+    C["Client"] -->|"POST /v1/chat"| H["Handler: up to 3 attempts, retry only before the first byte"]
+    H -->|"Acquire(prefix key)"| R["Router: rendezvous hashing, bounded load, admission queue (429 / 503)"]
+    R --> N1["SGLang node 1"]
+    R --> N2["SGLang node 2"]
+    R --> N3["SGLang node N"]
+    P["Active /health probes"] -->|"up / down"| R
+    B["Per-node circuit breaker"] -->|"admits or skips a node"| R
+    H -.->|"success / failure / timeout"| B
 ```
 
-| Mode | Splits | Communication | When to Use |
-|------|--------|--------------|-------------|
-| **DP** | Requests across replicas | None | Model fits in one GPU; scale QPS |
-| **TP** | Attention heads + FFN columns | All-Reduce (every layer) | Model too large for one GPU |
-| **EP** | MoE Experts across GPUs | All-to-All (Expert layers only) | MoE model + high concurrency |
-| **PP** | Layers across GPUs | Point-to-point | Pipeline across many nodes |
+**Provenance.** The original gateway, its README and the deployment runbooks come from a project my mentor assigned (UnicoreGPU team); they
+are preserved in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
+is mine: `git diff upstream-snapshot`. Order of work: the real-GPU runs came first (2026-07-27, see [data](benchmarks/results/real_gpu/sglang_parallelism_runs.csv)),
+then the gateway upgrade and the failure-injection benchmark. Design and failure modes: [docs/RELIABILITY.md](docs/RELIABILITY.md).
 
----
+## Reference scenarios and what was tested
 
-## Architecture
+The serving layer is workload-agnostic. It was evaluated against reference scenarios typical of private enterprise deployments
+(an internal assistant used by many employees with per-department system prompts, compliance-style analysis on a 32B model,
+low-latency financial workloads, MoE serving). Results below are observed in the tested configurations.
 
-### Mode 1 — DP=4 (Data Parallel, 4 replicas)
+| Reference scenario | Configuration | 4x RTX 4090 (PCIe) | 4x A100 (NVLink) |
+| --- | --- | --- | --- |
+| Many concurrent employees, per-department prompts | DP=4 replicas, prefix-affinity routing, per-node backpressure, Llama-3-8B | 40/40 requests, P50 1.22 s / P95 2.30 s; time to first token 38-62 ms warm vs 87-113 ms cold | 40/40, P50 0.92 s / P95 1.75 s |
+| 32B dense model that does not fit one GPU | TP=4, Qwen2.5-32B | 20/20, P50 4.84 s | 20/20, P50 2.75 s |
+| MoE model | TP=4 attention + EP=4 experts, Qwen1.5-MoE-A2.7B | 20/20, P50 1.65 s | 20/20, P50 0.85 s |
+| Low-latency workloads | 1 prefill + 1 decode GPU (PD disaggregation), Llama-3-8B | 30/30, P50 2.54 s | not run |
 
-Four independent SGLang instances, one per GPU. The Gateway routes by prefix-hash — same department/context always hits the same replica, keeping that replica's KV Cache hot.
+The two platforms differ in GPU, memory, SGLang version, driver, container path and, for the 4090 TP/EP runs, NCCL P2P settings, so the
+gap between columns is not attributable to interconnect alone ([docs/real-gpu-results.md](docs/real-gpu-results.md)).
 
-```
-Client → Go Gateway :8081
-             │ prefix_hash(system_prompt) % 4
-             ├─→ SGLang :30000  GPU 0  (replica 0 — e.g. Finance dept)
-             ├─→ SGLang :30001  GPU 1  (replica 1 — e.g. HR dept)
-             ├─→ SGLang :30002  GPU 2  (replica 2 — e.g. Engineering)
-             └─→ SGLang :30003  GPU 3  (replica 3 — e.g. Marketing)
+## What the original did and what changed
 
-No cross-GPU communication. Linear QPS scaling (4.0× verified).
-docker compose -f docker-compose.dp.yml up -d
-```
+| Area | Original (tag `upstream-snapshot`) | Now |
+| --- | --- | --- |
+| Routing | `FNV-32(sha256(system prompt)) % N` over all nodes; a node that is down still receives its share | Rendezvous hashing over nodes that are up and whose breaker admits traffic; losing 1 of 4 nodes remaps **0%** of the surviving nodes' keys (**75.3%** with the original scheme) |
+| Hot prompts | One department's prompt can pin a node at capacity | Bounded load: a node may exceed the mean by 1.25x (never below 4 concurrent) before requests spill to the next-ranked node |
+| Failure | One attempt: dead node -> `502`; stalled node -> the client waits up to the 10-minute timeout | Up to 3 attempts on different nodes, first-token timeout, stall detection; nothing is retried once a byte has reached the client |
+| Health | None | Active `/health` probes plus a per-node circuit breaker (closed / open / half-open, exponential cool-down) that also catches nodes whose `/health` is green but whose inference hangs |
+| Backpressure | Per-node semaphore, unbounded waiting | Same semaphore, but a bounded admission queue: `429` when full, `503` after `queue_timeout`, both with `Retry-After` |
+| Streams that break mid-way | Truncated silently | Client receives an explicit `upstream_interrupted` event; the breaker is charged |
+| Observability | 3 metrics, request histogram capped at 1 s | + upstream attempts by node and result, retries by reason, breaker transitions, mid-stream failures, time to first byte, queue wait, per-node up / breaker / in-flight gauges, `/readyz`, `/admin/nodes` |
+| HTTP client | A new `http.Client` per request | One shared client with connection pooling |
+| Tests | 1 (prefix hash) | 40 more: breaker state machine, router (affinity, remap, bounded load, queue), active health probes, config, metrics, and handler integration tests against fault-injecting workers, all under `go test -race` |
+| Config | JSON | Same file works unchanged; new optional `routing`, `reliability`, `admission` blocks |
 
----
+Endpoints, config keys, the PD `role` and `group` semantics and the Docker/compose files are unchanged.
 
-### Mode 2 — TP=4 (Tensor Parallel, one model across 4 GPUs)
+## Results
 
-Single SGLang instance, model weights split across all GPUs. Each GPU holds ~25% of attention heads and FFN columns. All-Reduce synchronizes activations after every transformer layer.
+Same config file, same load, four **simulated** SGLang workers (`gateway-go/internal/mock`, a latency model, not GPUs),
+16 closed-loop streaming clients, 30 s per run, Apple M1. One node is killed (`SIGKILL`, restarted at t=20 s) or given +3 s
+time-to-first-token (gray failure, `/health` stays green) from t=8 s to t=20 s. The "original" binary is built from the
+`upstream-snapshot` tag by the benchmark script. Method and caveats: [docs/RELIABILITY.md](docs/RELIABILITY.md).
 
-```
-Client → Go Gateway :8081 → SGLang :30000
-                               │
-                    ┌──────────┼──────────┐──────────┐
-                    ▼          ▼          ▼          ▼
-                  GPU 0      GPU 1      GPU 2      GPU 3
-               (25% weights)(25% weights)(25% weights)(25% weights)
-                    └──── All-Reduce after every layer ────┘
+| Scenario | Phase | Original clean completions | Original P50 / P95 | Upgraded clean completions | Upgraded P50 / P95 |
+| --- | --- | ---: | --- | ---: | --- |
+| Worker crash | before fault (0-8 s) | 96.8% | 869 / 1,291 ms | 98.9% | 374 / 446 ms |
+| | **during fault (8-20 s)** | **64.4%** | 1,209 / 1,393 ms | **100%** | 454 / 614 ms |
+| | after restart (20-30 s) | 100% | 825 / 1,207 ms | 100% | 374 / 449 ms |
+| Gray failure | before fault | 100% | 897 / 1,240 ms | 100% | 370 / 446 ms |
+| | **during fault** | 100% | 446 / **11,792** ms (only 87 requests finished) | 100% | 450 / **621** ms (409 requests) |
+| | after | 100% | 594 / 1,425 ms | 100% | 380 / 611 ms |
 
-Required when model > single-GPU VRAM (e.g. Qwen2.5-32B: 64 GB fp16 on 4× 24 GB)
-docker compose -f docker-compose.tp.yml up -d
-```
+Phases are by request start time, so requests in flight when the fault begins count as "before fault" (this is why both versions show a few failures in that row).
 
----
+Whole runs: worker crash, 85.2% (101 x HTTP 502) -> **99.7%** clean; gray failure, P99 11,792 ms -> **629 ms** and 458 -> 1,160 requests served.
 
-### Mode 3 — EP=4 (Expert Parallel, MoE model)
+![Crash timeline](benchmarks/plots/sim_crash_timeline.png)
+![Gray failure timeline](benchmarks/plots/sim_brownout_timeline.png)
+![Summary](benchmarks/plots/sim_summary.png)
 
-MoE model with Experts distributed across GPUs. Each token is routed to top-K experts; when those experts live on other GPUs, All-to-All carries the activations across cards. Combines with TP for Attention layers.
+Read these numbers carefully:
 
-```
-Client → Go Gateway :8081 → SGLang :30000
-                               │  TP=4 (Attention: All-Reduce)
-                    ┌──────────┼──────────┐──────────┐
-                    ▼          ▼          ▼          ▼
-                  GPU 0      GPU 1      GPU 2      GPU 3
-               Expert 0-15 Expert 16-31 Expert 32-47 Expert 48-63
-                    └──── All-to-All (Expert FFN layers) ───┘
+- **Two effects are mixed in the "before fault" rows.** With this workload's 12 system prompts the original hash puts
+  **7 / 4 / 0 / 1** of them on the four nodes, so one node is saturated and one idle before anything fails; bounded-load routing
+  spreads them, which is why P50 is about 2x lower with no fault at all. That is a real weakness of `hash % N` with few prompts,
+  but it is a load-balancing gain, not a failure-handling gain. The "during fault" rows are where failover and the breaker matter.
+- **The 4 remaining failures in the crash run** are streams that were already producing tokens on the killed node. They cannot be
+  retried without duplicating output, so they end with an explicit error event (`radixgates_midstream_failures_total` = 4). The breaker
+  opened on those failures, so only 1 request needed a retry (`radixgates_retries_total{reason="conn_error"}` = 1).
+- In the gray failure the upgraded gateway logged 7 first-token timeouts on the slow node (each request paid one 1 s timeout, max 1.5 s)
+  and then diverted traffic although `/health` stayed green: breaker transitions open 3, half-open 3, closed 1.
+- The failure scenarios run against simulated workers so that anyone can reproduce them on a laptop in about a minute, with no GPUs and no risk to a
+  shared machine. Each cell is one 30 s closed-loop run; the differences are large, and they describe gateway behaviour under failure, not GPU throughput.
 
-Log prefix [TP0 EP0]~[TP3 EP3] confirms 4 EP ranks running.
-docker compose -f docker-compose.ep.yml up -d
-```
+Raw data: `benchmarks/results/sim/<scenario>/<original|upgraded>/{requests.csv,summary.json,metrics.prom}`.
 
----
+## My multi-GPU evaluation of the original (real hardware)
 
-### Mode 4 — PD Disaggregation, Single Machine
+Before the changes above I ran the delivered RadixGates on rented 4x RTX 4090 (PCIe) and 4x A100-SXM4-40GB (NVLink) machines in DP=4,
+TP=4, EP=4 and PD modes and diagnosed the failures that came up (CUDA image vs driver, removed SGLang flags, NCCL initialisation, 40 GB OOM,
+a wedged GPU). Highlights: 4090 DP=4, Llama-3-8B, 40 concurrent requests, 40/40 succeeded, P50 1,215 ms / P95 2,300 ms, repeated-prefix time
+to first token 38-62 ms warm vs 87-113 ms cold; A100 TP=4 P50 2,754 ms and EP=4 846 ms against 4,836 ms and 1,653 ms on the 4090 box, which is
+**not** a clean NVLink-vs-PCIe comparison (different SGLang version, driver, deployment, and NCCL P2P disabled on the 4090 TP/EP runs).
+Data and caveats: [docs/real-gpu-results.md](docs/real-gpu-results.md); full logs (Chinese): `docs/lab-notes/实验记录4090.md`, `docs/lab-notes/实验记录A100.md`.
+The companion tool [llm-serving-eval-kit](https://github.com/YuchenHe985/llm-serving-eval-kit) turns those findings into a sizing estimator, a log
+diagnoser and a confounder-aware benchmark comparison.
 
-One machine, two GPUs. GPU 0 handles all prefill (compute-bound); GPU 1 handles all decode (memory-bandwidth-bound). KV cache is transferred via CUDA IPC (mooncake).
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Client                                                         │
-│    │  POST /v1/chat  (stream=true)                              │
-│    ▼                                                            │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │  Go Gateway  :8080                                         │ │
-│  │  • SHA-256 prefix_hash → consistent-hash node select      │ │
-│  │  • Semaphore: max 8 concurrent per node                    │ │
-│  │  • SSE proxy: streams tokens back to client                │ │
-│  └──────────────────────────┬─────────────────────────────────┘ │
-│                             │  HTTP POST /v1/chat               │
-│                             ▼                                   │
-│              ┌──────────────────────────┐                       │
-│              │   sglang_router  :9000   │                       │
-│              │   PD coordinator         │                       │
-│              └────────┬────────┬────────┘                       │
-│                       │        │                                │
-│                 prefill│        │decode                          │
-│                       ▼        ▼                                │
-│         ┌─────────────────┐  ┌─────────────────┐               │
-│         │ sglang-prefill  │  │ sglang-decode   │               │
-│         │ :30000  GPU 0   │  │ :30001  GPU 1   │               │
-│         │ Compute-bound   │  │ Memory-bw-bound │               │
-│         └────────┬────────┘  └─────────────────┘               │
-│                  │  KV cache transfer (mooncake · CUDA IPC)     │
-│                  └──────────────────────────────►               │
-└─────────────────────────────────────────────────────────────────┘
-
-docker compose -f docker-compose.pd.yml up -d
-```
-
----
-
-### Mode 5 — PD Disaggregation, Dual Machine
-
-Two machines, each running a full PD pair. Gateway prefix-hash partitions traffic — same system prompt always hits the same machine (KV Cache locality), while the two machines share total concurrency load.
-
-```
-                         Client
-                           │  POST /v1/chat
-                           ▼
-           ┌───────────────────────────────────┐
-           │  Go Gateway  :8080  (Machine 1)   │
-           │  prefix_hash(system_prompt) % 2   │
-           └───────────┬───────────────┬───────┘
-                       │               │
-              hash=0   │               │  hash=1
-                       ▼               ▼
-    ┌──────────────────────┐   ┌──────────────────────┐
-    │  sglang-router M1    │   │  sglang-router M2    │
-    └──────┬───────┬───────┘   └──────┬───────┬───────┘
-           │       │                  │       │
-     prefill│       │decode      prefill│       │decode
-           ▼       ▼                  ▼       ▼
-    ┌──────────┐ ┌──────────┐  ┌──────────┐ ┌──────────┐
-    │ prefill  │ │ decode   │  │ prefill  │ │ decode   │
-    │ GPU 0    │ │ GPU 1    │  │ GPU 0    │ │ GPU 1    │
-    └──────────┘ └──────────┘  └──────────┘ └──────────┘
-         KV transfer (mooncake)      KV transfer (mooncake)
-
-docker compose -f docker-compose.pd-node.yml up -d   # Machine 2
-M2_HOST=<m2-ip> docker compose -f docker-compose.pd.yml up -d   # Machine 1
-```
-
----
-
-## Demo Scripts
-
-| Script | What It Tests | Command |
-|--------|--------------|---------|
-| `examples/dp_demo.py` | DP=4 prefix-hash routing, KV cache hits, 40-concurrent throughput | `GATEWAY_URL=http://localhost:8081 python3 examples/dp_demo.py` |
-| `examples/tp_demo.py` | TP=4 weight sharding, symmetric GPU VRAM, TTFT + throughput | `GATEWAY_URL=http://localhost:8081 SGLANG_URL=http://localhost:30000 SGLANG_LOG=/tmp/sglang_tp.log python3 examples/tp_demo.py` |
-| `examples/ep_demo.py` | EP=4 MoE Expert routing, All-to-All log rank confirmation | `GATEWAY_URL=http://localhost:8081 SGLANG_URL=http://localhost:30000 SGLANG_LOG=/tmp/sglang_ep.log python3 examples/ep_demo.py` |
-| `examples/pd_demo.py` | PD KV transfer (`#transfer-req`), prefix-cache TTFT, 30-concurrent | `python3 examples/pd_demo.py` |
-| `examples/enterprise_qa_demo.py` | 30-user multi-dept concurrent Q&A, prefix-hash partition LB | `GATEWAY_URL=http://localhost:8081 python3 examples/enterprise_qa_demo.py` |
-| `examples/streaming_demo.py` | SSE token-by-token streaming, Gateway direct mode | `GATEWAY_URL=http://localhost:8081 python3 examples/streaming_demo.py` |
-
-All scripts accept `GATEWAY_URL` via environment variable. Logs are auto-saved to `examples/logs/` with hardware tag in filename (e.g. `dp_demo_4xRTX4090_Llama3-8B_DP4.log`).
-
----
-
-## Key Features
-
-### Prefix-Aware Consistent Hash Routing
-The Gateway extracts a SHA-256 fingerprint (`prefix_hash`) from each request's system prompt:
-- Same department / same RAG context → same `prefix_hash` → same node → same SGLang instance
-- SGLang's **RadixAttention** keeps that context in GPU SRAM across requests
-- **Result**: TTFT drops from 861 ms → 82 ms (10.5×) on 7720-token context
-
-### Semaphore-Based Backpressure
-```go
-sem := make(chan struct{}, maxConcurrent) // e.g. 8 slots per node
-sem <- struct{}{}                         // blocks if all slots taken
-defer func() { <-sem }()                 // always releases
-```
-Unlike a queue, goroutines waiting on the semaphore consume almost no memory and resume the instant a slot opens.
-
-### Direct SSE Streaming
-- Gateway acquires a semaphore slot → forwards request as HTTP streaming call
-- Proxies Server-Sent Events token-by-token to the client
-- No task_id, no polling, no intermediate broker — pure synchronous SSE, held open for the request
-
-### Hardware-Tagged Log Files
-`_log_utils.print_hw_info()` auto-detects GPU model, count, and interconnect type (NVLink vs PCIe) and appends a hardware tag to every log filename. Makes multi-machine benchmark comparison unambiguous.
-
-### Prometheus Metrics
-Built-in `/metrics` endpoint:
-
-| Metric | Type | Meaning |
-|--------|------|---------|
-| `radixgates_requests_total{status}` | Counter | Requests by outcome |
-| `radixgates_request_duration_seconds` | Histogram | Gateway-side P50/P95/P99 latency |
-| `radixgates_active_requests` | Gauge | In-flight requests |
-
----
-
-## Deployment
-
-### Docker Path (standard VMs)
+## Try it
 
 ```bash
-# DP=4
+make test                                       # vet + 41 tests under -race
+make bench                                      # original vs upgraded, crash and gray failure, ~2 min (needs go, curl, python3)
+make plots                                      # needs matplotlib
+
+# run against real SGLang nodes, unchanged from the original docs
 docker compose -f docker-compose.dp.yml up -d
-
-# TP=4 (set MODEL_PATH and TP_SIZE)
-TP_SIZE=4 MODEL_PATH=Qwen/Qwen2.5-32B-Instruct docker compose -f docker-compose.tp.yml up -d
-
-# EP=4
-EP_SIZE=4 MODEL_PATH=Qwen/Qwen1.5-MoE-A2.7B-Chat docker compose -f docker-compose.ep.yml up -d
-
-# PD disaggregation
-docker compose -f docker-compose.pd.yml up -d
+curl localhost:8080/readyz ; curl localhost:8080/admin/nodes ; curl localhost:8080/metrics | grep radixgates_
 ```
 
-### No-Docker Path (Vast.ai containers, overlayfs restricted)
+Optional config (defaults shown; everything is optional):
 
-Some cloud instances (e.g. Vast.ai containerized templates) block Docker's bridge networking and overlayfs. Run SGLang and Gateway natively with tmux:
-
-```bash
-# Install
-pip install "sglang[all]" -q
-wget -q https://go.dev/dl/go1.23.4.linux-amd64.tar.gz -O /tmp/go.tar.gz
-tar -C /usr/local -xzf /tmp/go.tar.gz && export PATH=$PATH:/usr/local/go/bin
-
-# Build Gateway
-cd ~/RadixGates/gateway-go && go build -o /usr/local/bin/sglang_gateway .
-
-# Launch DP=4 (one tmux session per GPU)
-for GPU in 0 1 2 3; do
-  tmux new-session -d -s sglang$GPU \
-    "CUDA_VISIBLE_DEVICES=$GPU python3 -m sglang.launch_server \
-       --model-path NousResearch/Meta-Llama-3-8B-Instruct \
-       --port $((30000+GPU)) --host 0.0.0.0 --mem-fraction-static 0.85 \
-       2>&1 | tee /tmp/sglang${GPU}.log"
-done
-
-# Launch TP=4 (single process, all GPUs)
-tmux new-session -d -s sglang_tp \
-  "CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m sglang.launch_server \
-     --model-path Qwen/Qwen2.5-32B-Instruct \
-     --tensor-parallel-size 4 --port 30000 --mem-fraction-static 0.80 \
-     2>&1 | tee /tmp/sglang_tp.log"
+```json
+{
+  "routing":     { "bounded_load_factor": 1.25, "affinity_floor": 4 },
+  "reliability": { "max_attempts": 3, "attempt_timeout": "15s", "stream_idle_timeout": "30s",
+                   "breaker": { "enabled": true, "failure_threshold": 5, "open_duration": "5s" },
+                   "health":  { "enabled": true, "interval": "2s", "path": "/health" } },
+  "admission":   { "max_queue": 128, "queue_timeout": "10s" }
+}
 ```
-
-Full step-by-step runbook (including port conflict handling, EP setup, SSH tunnel): [`agents/deployment/agent.md`](agents/deployment/agent.md)
-
----
-
-## Directory Structure
-
-```text
-RadixGates/
-├── gateway-go/                    # Go Gateway — the only service (direct mode)
-│   ├── main.go                    # Entry: load config → register route → HTTP server → graceful shutdown
-│   ├── handler/
-│   │   ├── direct.go              # Core: POST /v1/chat — parse → route → semaphore → forward → SSE proxy
-│   │   ├── chat.go                # Shared types (ChatRequest/Message) + prefixHash + writeJSON helper
-│   │   └── chat_test.go           # Unit test for computePrefixHash
-│   ├── router/
-│   │   └── router.go              # Node pool + consistent-hash node selection + per-node semaphore
-│   ├── metrics/
-│   │   └── metrics.go             # Prometheus metric definitions (requests_total / duration / active)
-│   └── config/
-│       ├── config.go              # Config struct + defaults + Load()
-│       └── config.json            # Gateway runtime config (port, sglang_instances, max_concurrent)
-├── examples/
-│   ├── dp_demo.py                 # DP=4: prefix-hash routing + 40-concurrent benchmark
-│   ├── tp_demo.py                 # TP=4: weight sharding + TTFT/throughput benchmark
-│   ├── ep_demo.py                 # EP=4: MoE Expert routing + All-to-All verification
-│   ├── pd_demo.py                 # PD: KV transfer + prefix-cache TTFT benchmark
-│   ├── enterprise_qa_demo.py      # 30-user multi-dept concurrent Q&A
-│   ├── streaming_demo.py          # SSE token-by-token streaming demo
-│   ├── _log_utils.py              # Hardware detection + log collection utility
-│   └── logs/                      # Auto-saved benchmark logs (hardware-tagged filenames)
-├── agents/
-│   ├── deployment/
-│   │   ├── agent.md               # AI-agent-executable deployment runbook (Docker + no-Docker)
-│   │   └── skills/                # Failure pattern fixes (nvidia-docker, port conflicts, etc.)
-│   └── env-setup/
-│       ├── agent.md               # .env configuration guide (SSH_TARGET for log collection)
-│       └── .env.example           # Template for local environment variables
-├── scripts/                       # SGLang launch (incl. PD prefill/decode), benchmark, wrk load tests
-├── mock_docs/                     # Sample documents used by the enterprise-QA demo
-├── docs/
-│   └── benchmark_parallel_modes.md  # DP/TP/EP verified benchmark results + H100 placeholders
-├── docker-compose.dp.yml          # DP=4: 4 SGLang replicas, one per GPU  (gateway routing_mode=direct)
-├── docker-compose.tp.yml          # TP=4: single SGLang, weights split across GPUs
-├── docker-compose.ep.yml          # EP=4: MoE model, Expert routing across GPUs
-├── docker-compose.pd.yml          # PD disaggregation — Machine 1 (gateway + PD pair)
-├── docker-compose.pd-node.yml     # PD disaggregation — Machine 2+ (PD node)
-└── Dockerfile                     # Multi-stage Go build → unicoregpu2020/radixgates:latest
-```
-
----
-
-## Resume Description
-
-> **RadixGates — Private LLM Inference Gateway** | Go · SGLang · Docker · Prometheus
->
-> - Built an enterprise-grade API gateway in **Go 1.22** for private LLM deployment; supports **DP / TP / EP / PD** parallel modes — selecting and stacking based on model size and QPS target.
-> - Implemented and verified **multi-GPU parallelism** on 4× RTX 4090 (SGLang 0.5.10): DP=4 Llama-3-8B (**40/40, 4.0× linear QPS scaling**); TP=4 Qwen2.5-32B (**tensor_parallel_size=4 confirmed**, 64 GB model across 4× 24 GB GPUs); EP=4 Qwen1.5-MoE (**`[TP0 EP0]~[TP3 EP3]` All-to-All confirmed**, 20/20 P50=1099ms).
-> - Implemented **PD disaggregation** across dual RTX 4090s — prefill and decode on dedicated GPUs with CUDA IPC KV cache transfer (mooncake); **30-concurrent: 30/30 in 5.2 s**.
-> - Designed **prefix-aware consistent hash routing**: SHA-256 fingerprints route same-context requests to the same replica; combined with SGLang's RadixAttention, reduces TTFT from **861 ms → 82 ms (10.5×)** on 7720-token workloads.
-> - Built **semaphore-based backpressure** (`chan struct{}`): bounds per-GPU concurrency with zero dropped requests; exposed **Prometheus `/metrics`** for QPS, P95 latency, and active-request tracking.
-> - Authored AI-agent-executable deployment runbook (`agents/deployment/agent.md`) covering Docker and no-Docker (Vast.ai containerized) environments, with DP/TP/EP launch commands and verified demo scripts.
-
----
-
-*Built by the UnicoreGPU team.*
