@@ -25,6 +25,24 @@ flowchart LR
     H -.->|"success / failure / timeout"| B
 ```
 
+## Why this was built, and in what order
+
+**Starting point.** Running SGLang on several GPU nodes needs something in front that sends a repeated system prompt to the node that already holds its KV cache.
+The gateway delivered with this project did that with `FNV-32(system prompt) % N`. I deployed and benchmarked it on two rented multi-GPU machines, and reading it
+against what an operator would meet, four things stood out: a dead node kept its share of the traffic and answered `502`; a node that stopped answering held a request
+until the client's 10-minute timeout; one popular prompt could pin a node at capacity; and almost nothing showed any of it (three metrics).
+
+**What I changed, in this order.** Failure handling first (active health probes, a per-node circuit breaker, retries only before the first byte so no output is duplicated),
+then load (bounded load, an admission queue that answers `429` or `503` with `Retry-After`), then visibility (Prometheus metrics, `/readyz`, `/admin/nodes`). Each change is
+measured against the original binary under the same injected faults, not judged by eye.
+
+**The check that changed one of my own rules.** The failure benchmark uses simulated workers. Putting the gateway in front of real llama.cpp servers showed that spilling to the
+next node when the preferred one is full, a rule I had added, cut prefix-cache hits from 59% to 24% when each node's cache is small. That led to placement memory and the
+affinity wait, and to [a guide for choosing between them](docs/OPERATING.md).
+
+**Who it is for.** Teams running a pool of OpenAI-compatible inference nodes who need failover, cache-aware routing and something to alert on, and who want code small enough
+to read and change themselves.
+
 **Provenance.** The original gateway, its README and the deployment runbooks come from a project my mentor assigned (UnicoreGPU team); they
 are preserved in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
 is mine: `git diff upstream-snapshot`. Order of work: the real-GPU runs came first (2026-07-27, see [data](benchmarks/results/real_gpu/sglang_parallelism_runs.csv)),
