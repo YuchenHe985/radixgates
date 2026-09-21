@@ -44,7 +44,7 @@ affinity wait, and to [a guide for choosing between them](docs/OPERATING.md).
 to read and change themselves.
 
 **Deployment boundary.** This is a production-oriented reference gateway, not a public-edge product. It has no built-in authentication, authorization, TLS termination,
-tenant quotas, request-body limit, or audit-log sink; `/admin/nodes` and `/metrics` expose operational state. Deploy it on a private network behind an authenticated ingress,
+tenant quotas, or audit-log sink; request bodies are capped at **4 MiB**, and `/admin/nodes` and `/metrics` expose operational state. Deploy it on a private network behind an authenticated ingress,
 restrict the admin and metrics routes, and pin container images/model revisions instead of using `latest`. The gateway accepts both the historical `POST /v1/chat` route and
 the standard `POST /v1/chat/completions` route. See [docs/OPERATING.md](docs/OPERATING.md) for the controls that are implemented.
 
