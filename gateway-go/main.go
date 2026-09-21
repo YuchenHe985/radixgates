@@ -83,7 +83,8 @@ func main() {
 	log.Println("[Gateway] Stopped cleanly.")
 }
 
-// setupDirectRoutes wires POST /v1/chat to the direct SGLang handler: the gateway
+// setupDirectRoutes wires the legacy POST /v1/chat path and the OpenAI-compatible
+// POST /v1/chat/completions path to the direct SGLang handler: the gateway
 // forwards to a selected SGLang node (failing over to another before the first byte
 // is committed) and streams the response back to the client via SSE.
 func setupDirectRoutes(ctx context.Context, mux *http.ServeMux, cfg *config.Config) *router.Router {
@@ -110,7 +111,7 @@ func setupDirectRoutes(ctx context.Context, mux *http.ServeMux, cfg *config.Conf
 	metrics.RegisterRouter(r)
 
 	h := &handler.DirectChatHandler{Router: r, DefaultModel: cfg.DefaultModel, Reliability: cfg.Reliability}
-	mux.Handle("POST /v1/chat", h)
+	registerChatRoutes(mux, h)
 	if hc := cfg.Reliability.Health; hc.Enabled {
 		r.StartHealthChecks(ctx, router.HealthOptions{Interval: hc.Interval.Std(), Timeout: hc.Timeout.Std(),
 			Path: hc.Path, UnhealthyThreshold: hc.UnhealthyThreshold, HealthyThreshold: hc.HealthyThreshold}, h.Client())
@@ -118,4 +119,9 @@ func setupDirectRoutes(ctx context.Context, mux *http.ServeMux, cfg *config.Conf
 	log.Printf("[Gateway] Direct mode: %d SGLang node(s), max_attempts=%d breaker=%v health_checks=%v",
 		len(cfg.SGLangInstances), cfg.Reliability.MaxAttempts, cfg.Reliability.Breaker.Enabled, cfg.Reliability.Health.Enabled)
 	return r
+}
+
+func registerChatRoutes(mux *http.ServeMux, h http.Handler) {
+	mux.Handle("POST /v1/chat", h)
+	mux.Handle("POST /v1/chat/completions", h)
 }
