@@ -43,6 +43,11 @@ affinity wait, and to [a guide for choosing between them](docs/OPERATING.md).
 **Who it is for.** Teams running a pool of OpenAI-compatible inference nodes who need failover, cache-aware routing and something to alert on, and who want code small enough
 to read and change themselves.
 
+**Deployment boundary.** This is a production-oriented reference gateway, not a public-edge product. It has no built-in authentication, authorization, TLS termination,
+tenant quotas, or audit-log sink; request bodies are capped at **4 MiB**, and `/admin/nodes` and `/metrics` expose operational state. Deploy it on a private network behind an authenticated ingress,
+restrict the admin and metrics routes, and pin container images/model revisions instead of using `latest`. The gateway accepts both the historical `POST /v1/chat` route and
+the standard `POST /v1/chat/completions` route. See [docs/OPERATING.md](docs/OPERATING.md) for the controls that are implemented.
+
 **Provenance.** The original gateway, its README and the deployment runbooks come from a project my mentor assigned (UnicoreGPU team); they
 are preserved in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
 is mine: `git diff upstream-snapshot`. Order of work: the real-GPU runs came first (2026-07-27, see [data](benchmarks/results/real_gpu/sglang_parallelism_runs.csv)),
@@ -79,7 +84,8 @@ gap between columns is not attributable to interconnect alone ([docs/real-gpu-re
 | Tests | 1 (prefix hash) | 52 more: breaker state machine, router (affinity, remap, bounded load, queue), active health probes, config, metrics, and handler integration tests against fault-injecting workers, all under `go test -race` |
 | Config | JSON | Same file works unchanged; new optional `routing`, `reliability`, `admission` blocks |
 
-Endpoints, config keys, the PD `role` and `group` semantics and the Docker/compose files are unchanged.
+Config keys, the PD `role` and `group` semantics and the Docker/compose files are unchanged. The legacy `/v1/chat` endpoint remains; `/v1/chat/completions` is an alias for
+OpenAI-compatible clients.
 
 ## Results
 
@@ -180,6 +186,8 @@ make plots                                      # needs matplotlib
 docker compose -f docker-compose.dp.yml up -d
 curl localhost:8080/readyz ; curl localhost:8080/admin/nodes ; curl localhost:8080/metrics | grep radixgates_
 ```
+
+The compose files retain the upstream `latest` defaults for compatibility. Set explicit image tags or digests before treating a deployment as reproducible.
 
 Optional config (defaults shown; everything is optional):
 

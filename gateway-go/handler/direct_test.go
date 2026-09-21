@@ -3,6 +3,7 @@ package handler
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -173,6 +174,51 @@ func TestNonStreamingResponseAndBadRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", resp.StatusCode)
 	}
+}
+
+func TestOpenAIFieldsAndMultimodalContentArePreserved(t *testing.T) {
+	got := make(chan map[string]json.RawMessage, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var fields map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+			t.Fatal(err)
+		}
+		got <- fields
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+	host, port, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "http://"))
+	p, _ := strconv.Atoi(port)
+	rt := router.New([]config.SGLangInstance{{Group: "local", Host: host, Port: p, MaxConcurrent: 4}}, 4,
+		router.Options{BoundedLoadFactor: 1.25, AffinityFloor: 4, MaxQueue: 4, QueueTimeout: time.Second})
+	h := &DirectChatHandler{Router: rt, DefaultModel: "fallback"}
+
+	body := `{"model":"m","stream":false,"top_p":0.8,"tools":[{"type":"function","function":{"name":"lookup"}}],` +
+		`"response_format":{"type":"json_object"},"target":"local","messages":[{"role":"system","content":[{"type":"text","text":"policy"}]},{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	forwarded := <-got
+	for _, key := range []string{"tools", "top_p", "response_format"} {
+		if _, ok := forwarded[key]; !ok {
+			t.Fatalf("%s was dropped: %s", key, string(mustJSON(forwarded)))
+		}
+	}
+	if _, ok := forwarded["target"]; ok {
+		t.Fatal("gateway-only target field reached the upstream")
+	}
+	if !strings.Contains(string(forwarded["messages"]), `"type":"text"`) {
+		t.Fatalf("multimodal content changed: %s", forwarded["messages"])
+	}
+}
+
+func mustJSON(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func TestDeadNodeIsRetriedThenSkipped(t *testing.T) {

@@ -11,8 +11,8 @@ import (
 // ── Request / Response types ─────────────────────────────────────────────────
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
 }
 
 type ChatRequest struct {
@@ -25,6 +25,16 @@ type ChatRequest struct {
 	//   "local" / "remote" → prefer that group
 	//   omit / ""          → no preference, any group
 	Target string `json:"target,omitempty"`
+}
+
+func messageContentForRouting(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	// Multimodal content is still a stable routing key even when it is not a
+	// plain string. The original bytes are forwarded unchanged.
+	return string(raw)
 }
 
 // computePrefixHash returns the SHA-256 hex of the system prompt content.

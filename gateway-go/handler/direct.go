@@ -128,9 +128,18 @@ func (h *DirectChatHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}()
 	finish := func(o string) { metrics.RequestsTotal.WithLabelValues(o).Inc() }
 
-	// 1. Parse body
+	// 1. Parse the routing fields, while retaining the complete request so an
+	// OpenAI-compatible client does not lose tools, response_format, top_p,
+	// multimodal content, or future upstream fields.
+	raw, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, 4<<20))
+	if err != nil {
+		finish("bad_request")
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body is invalid or exceeds 4 MiB"})
+		return
+	}
 	var req ChatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 4<<20)).Decode(&req); err != nil || len(req.Messages) == 0 {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &req); err != nil || len(req.Messages) == 0 || json.Unmarshal(raw, &fields) != nil {
 		finish("bad_request")
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing or invalid 'messages' field"})
 		return
@@ -158,16 +167,27 @@ func (h *DirectChatHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	systemContent := ""
 	for _, m := range req.Messages {
 		if m.Role == "system" {
-			systemContent = m.Content
+			systemContent = messageContentForRouting(m.Content)
 			break
 		}
 	}
 	prefixHash := computePrefixHash(systemContent)
 
-	body, _ := json.Marshal(map[string]interface{}{
-		"model": model, "messages": req.Messages, "stream": streamMode,
-		"temperature": temperature, "max_tokens": maxTokens,
-	})
+	fields["model"], _ = json.Marshal(model)
+	fields["stream"], _ = json.Marshal(streamMode)
+	if _, ok := fields["temperature"]; !ok {
+		fields["temperature"], _ = json.Marshal(temperature)
+	}
+	if _, ok := fields["max_tokens"]; !ok {
+		fields["max_tokens"], _ = json.Marshal(maxTokens)
+	}
+	delete(fields, "target") // gateway-only routing hint; SGLang should not see it
+	body, err := json.Marshal(fields)
+	if err != nil {
+		finish("bad_request")
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body could not be forwarded"})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.rel.OverallTimeout.Std())
 	defer cancel()

@@ -8,7 +8,8 @@ owner's permission; the imported code is theirs and is tagged `upstream-snapshot
 
 My additions and rewrites (`gateway-go/breaker`, `gateway-go/router`, `gateway-go/handler/direct.go`,
 `gateway-go/metrics`, `gateway-go/config`, `gateway-go/main.go`, `gateway-go/cmd`, `gateway-go/internal`,
-`benchmarks/`, `.github/`, `docs/real-gpu-results.md`, `README.md`) are offered under the MIT licence.
+`benchmarks/`, `.github/`, `docs/real-gpu-results.md`, `README.md`) are offered under the MIT licence in
+[`LICENSE-YUCHEN-MIT`](LICENSE-YUCHEN-MIT). That licence does not grant rights to the unlicensed upstream snapshot.
 
 Rented-machine addresses and key names that appeared in the upstream docs and examples were replaced with documentation example
 addresses (203.0.113.10). The accompanying slides, which embedded them, are omitted; the lab notes in `docs/lab-notes/` carry the same content.
