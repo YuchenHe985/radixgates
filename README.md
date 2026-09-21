@@ -1,6 +1,6 @@
 # RadixGates: a failure-tolerant gateway for multi-GPU LLM serving
 
-[![ci](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml/badge.svg)](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml)
+[![ci](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml/badge.svg)](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml) ![Go 1.23](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white)
 
 RadixGates is a Go gateway in front of SGLang. It routes each request by its system-prompt prefix so a node's KV cache is reused,
 and spreads load across data-parallel replicas and prefill/decode nodes. This repository has three parts: the delivered project,
@@ -15,7 +15,7 @@ bounded retries, load-aware routing, admission control) measured against the ori
 
 ```mermaid
 flowchart LR
-    C["Client"] -->|"POST /v1/chat"| H["Handler: up to 3 attempts, retry only before the first byte"]
+    C["Client"] -->|"POST /v1/chat/completions"| H["Handler: up to 3 attempts, retry only before the first byte"]
     H -->|"Acquire(prefix key)"| R["Router: rendezvous hashing, bounded load, admission queue (429 / 503)"]
     R --> N1["SGLang node 1"]
     R --> N2["SGLang node 2"]
