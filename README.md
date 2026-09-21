@@ -11,7 +11,7 @@ bounded retries, load-aware routing, admission control) measured against the ori
 - **Node crash.** Clean completions **85.2% -> 99.7%**. **Gray failure** (`/health` green, inference hung): P99 **11.8 s -> 0.6 s**. Same config, same load, the original built from tag `upstream-snapshot`.
 - **No duplicated output.** A request is retried only before its first byte reaches the client; a stream that breaks mid-way ends with an explicit `upstream_interrupted` event.
 - **53 tests under `go test -race`** (52 added): circuit-breaker state machine, routing, active health probes, admission queue, metrics, and handler integration tests against workers that crash, hang, reset connections and fail mid-stream.
-- **Real hardware.** The same DP / TP / EP test matrix on 4x RTX 4090 (PCIe) and 4x A100 (NVLink), plus PD disaggregation on the 4090 machine; 8 deployment failures root-caused (CUDA image vs driver, removed SGLang flags, NCCL initialisation in Docker, 40 GB OOM, a wedged GPU).
+- **Real hardware.** The same DP / TP / EP test matrix on 4x RTX 4090 (PCIe) and 4x A100 (NVLink), plus PD disaggregation on the 4090 machine; 8 deployment failures diagnosed or isolated (CUDA image vs driver, removed SGLang flags, NCCL initialisation in Docker, 40 GB OOM, a wedged GPU).
 
 ```mermaid
 flowchart LR
@@ -171,7 +171,7 @@ TP=4, EP=4 and PD modes and diagnosed the failures that came up (CUDA image vs d
 a wedged GPU). Highlights: 4090 DP=4, Llama-3-8B, 40 concurrent requests, 40/40 succeeded, P50 1,215 ms / P95 2,300 ms, repeated-prefix time
 to first token 38-62 ms warm vs 87-113 ms cold; A100 TP=4 P50 2,754 ms and EP=4 846 ms against 4,836 ms and 1,653 ms on the 4090 box, which is
 **not** a clean NVLink-vs-PCIe comparison (different SGLang version, driver, deployment, and NCCL P2P disabled on the 4090 TP/EP runs).
-Data and caveats: [docs/real-gpu-results.md](docs/real-gpu-results.md); full logs (Chinese): `docs/lab-notes/实验记录4090.md`, `docs/lab-notes/实验记录A100.md`.
+Data and caveats: [docs/real-gpu-results.md](docs/real-gpu-results.md); deployment reports: [`4× RTX 4090`](docs/lab-notes/实验记录4090.md), [`4× A100-SXM4`](docs/lab-notes/实验记录A100.md).
 The companion tool [llm-serving-eval-kit](https://github.com/YuchenHe985/llm-serving-eval-kit) turns those findings into a sizing estimator, a log
 diagnoser and a confounder-aware benchmark comparison.
 
