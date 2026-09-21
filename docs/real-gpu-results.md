@@ -3,7 +3,7 @@
 Data: [`benchmarks/results/real_gpu/sglang_parallelism_runs.csv`](../benchmarks/results/real_gpu/sglang_parallelism_runs.csv).
 All runs were done by me on rented machines on 2026-07-27, with RadixGates as delivered (git tag
 `upstream-snapshot`) in front of SGLang. The numbers come from my own experiment logs (one run per
-cell, demo-script output); the full logs, in Chinese, are `docs/lab-notes/实验记录4090.md` and `docs/lab-notes/实验记录A100.md`.
+cell, demo-script output); the condensed engineering reports are the [RTX 4090 deployment report](lab-notes/实验记录4090.md) and [A100 deployment report](lab-notes/实验记录A100.md).
 
 ## Results
 
@@ -47,10 +47,10 @@ first-request warm-up and should not be compared with the 4090 cold numbers.
 | --- | --- | --- |
 | Container will not start: `requirement error: unsatisfied condition: cuda>=13.0` | `latest` image built for CUDA 13.0, driver supports up to 12.9 | Use the `cu129` runtime image |
 | `unrecognized arguments: --enable-prefix-caching` | Flag removed in newer SGLang (radix cache is on by default) | Drop the flag |
-| TP container restart loop, `NCCL error: unhandled system error` at `ncclCommInitRank` | Multi-GPU NCCL in Docker needs more shared memory; P2P unreliable on PCIe consumer cards | `ipc: host`, `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1` (slower path) |
+| TP container restart loop, `NCCL error: unhandled system error` at `ncclCommInitRank` | NCCL communicator creation failed in this Docker/host configuration; shared memory and P2P behavior were candidate factors, not independently isolated | `ipc: host`, `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1` (slower path) |
 | `unrecognized arguments: --enable-expert-parallel` | Replaced by `--ep-size N` in newer SGLang | Use `--ep-size 4` |
 | `torch.OutOfMemoryError` at startup on 40 GB GPUs | `--mem-fraction-static 0.85` too high once auxiliary processes are counted | 0.75 and `expandable_segments:True` |
-| One GPU unusable (`cudaErrorDevicesUnavailable`) after starting four servers at once | Race during simultaneous initialisation left a dead CUDA context; no permission to reset the GPU in a container | Start replicas 15 s apart; if it persists, replace the machine |
+| One GPU unusable (`cudaErrorDevicesUnavailable`) after starting four servers at once | The device remained unavailable after cleanup; the host-level cause could not be isolated without reset privileges | Run per-GPU preflight checks, stagger startups, and replace the host if the device remains unavailable |
 | Gateway would not start on the A100 machine | Port 8080 was already taken by the machine image's Jupyter | Run the gateway on 8081 (`GATEWAY_URL=http://localhost:8081`) |
 | Model download stalled | Several download processes fought over the same partial files | Kill duplicates, delete the `.incomplete` shards, download once |
 
