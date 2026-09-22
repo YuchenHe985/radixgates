@@ -1,22 +1,22 @@
 """
-tp_demo.py — Tensor Parallel (TP) 模式演示与验证
+tp_demo.py — Tensor Parallel (TP) validation and benchmark.
 
-架构：
-  GPU 0 + GPU 1 → 单个 SGLang 实例 (:30000)，--tensor-parallel-size 2
-  每张卡持有约 50% 的模型权重，每层计算后做 All-Reduce 同步激活值
-  Gateway (:8080) 路由到该实例 — TP 对 Gateway 完全透明
+Architecture:
+  GPU 0 + GPU 1 → one SGLang instance (:30000), --tensor-parallel-size 2
+  each GPU holds a weight shard and participates in layer collectives
+  Gateway (:8080) routes to that instance; TP is transparent to the gateway
 
-  与 PD 分离的区别：
-    PD  — 两个 SGLang 进程，GPU 0 做 prefill，GPU 1 做 decode
-    TP  — 一个 SGLang 进程，GPU 0 + GPU 1 各持有半份权重
+  TP versus PD:
+    PD — separate prefill and decode processes
+    TP — one process with weights sharded across GPUs
 
-启动方式：
+Launch:
   docker compose -f docker-compose.tp.yml up -d
   python3 examples/tp_demo.py
 
-推荐机器（Vast.ai）：
+Example host:
   2× RTX 4090 (24 GB each) + Qwen/Qwen2.5-14B-Instruct
-  → 模型 28 GB fp16，单卡放不下，TP=2 是必须项，不是可选项
+  → ~28 GB fp16 weights require sharding on a 24 GB GPU
 """
 
 import concurrent.futures
@@ -82,7 +82,7 @@ def check_gateway():
         mode = r.json().get("mode", "unknown")
         print(f"✅ Gateway: mode={mode!r}")
     except Exception as e:
-        print(f"❌ Gateway 连不上: {e}")
+        print(f"❌ Cannot reach gateway: {e}")
         sys.exit(1)
 
 
@@ -97,7 +97,7 @@ def check_tp_active() -> bool:
     Returns True if TP is confirmed, False otherwise.
     """
     print("\n" + "=" * 60)
-    print("🔍 TP 验证 — SGLang 服务器参数")
+    print("🔍 TP validation — SGLang server parameters")
     print("=" * 60)
 
     tp_confirmed = False
@@ -167,19 +167,18 @@ def check_tp_active() -> bool:
 
     if tp_size_found is not None:
         tp_ok = isinstance(tp_size_found, int) and tp_size_found > 1
-        mark  = "✅ TP 已激活" if tp_ok else "⚠️  单 GPU 模式（tp=1）"
+        mark  = "✅ TP enabled" if tp_ok else "⚠️  single-GPU mode (tp=1)"
         print(f"  tensor_parallel_size  : {tp_size_found}   {mark}")
         tp_confirmed = tp_ok
     else:
-        print("  tensor_parallel_size  : 未找到（三个来源均无结果）")
+        print("  tensor_parallel_size  : not found in the available sources")
 
     print()
     if tp_confirmed:
-        print(f"  ✅ TP 运行确认：tensor_parallel_size={tp_size_found}，多 GPU 张量并行已激活")
+        print(f"  ✅ TP confirmed: tensor_parallel_size={tp_size_found}")
     else:
         # GPU memory symmetry is still strong circumstantial evidence
-        print("  ⚠️  API/log 未返回 tp_size，将以 GPU 显存对称性作为验证依据")
-        print("     若所有 GPU 显存均 >50%（且模型超出单卡容量），TP 事实上已生效")
+        print("  ⚠️  API/log did not expose tp_size; GPU allocation is only supporting evidence")
 
     return tp_confirmed, tp_size_found
 
@@ -190,10 +189,10 @@ def check_gpu_memory(label: str = "") -> None:
     In TP mode both GPUs should show comparable high usage
     (model weights split evenly). Prints a verdict line.
     """
-    title = f"🖥️  GPU 显存占用{(' — ' + label) if label else ''}"
+    title = f"🖥️  GPU memory{(' — ' + label) if label else ''}"
     print("\n" + "=" * 60)
     print(title)
-    print("   TP 模式：两卡各持约 50% 权重，显存应均显著占用")
+    print("   TP should allocate a model shard on each participating GPU")
     print("=" * 60)
 
     try:
@@ -218,23 +217,23 @@ def check_gpu_memory(label: str = "") -> None:
             # Consider a GPU "loaded" if it holds >20% VRAM (idle baseline is ~1-2%)
             gpu_ok  = pct > 20
             loaded.append(gpu_ok)
-            mark    = "✅" if gpu_ok else "○ (空闲)"
+            mark    = "✅" if gpu_ok else "○ (idle)"
             print(f"  GPU {idx} [{name}]")
             print(f"    {bar}  {used}/{total} MB  ({pct:.1f}%)  {mark}")
             rows.append((idx, name, used, total, pct))
 
         print()
         if len(rows) >= 2 and all(loaded):
-            print("  → 所有 GPU 均有显著显存占用，权重已分片加载")
-            print("  → TP 运行状态：✅ 两卡协同确认")
+            print("  → All participating GPUs have material memory allocation")
+            print("  → This is consistent with sharded model loading")
         elif len(rows) == 1 or (rows and not all(loaded)):
-            print("  → ⚠️  仅 1 张 GPU 有显存占用，TP 可能未生效")
-            print("       或 SGLang 尚未完成模型加载（等待后重试）")
+            print("  → ⚠️  Only one GPU has material allocation; TP may not be ready")
+            print("       Wait for model loading to finish and rerun the check")
         else:
-            print("  → 未检测到 GPU 信息")
+            print("  → No GPU information detected")
 
     except FileNotFoundError:
-        print("  nvidia-smi 不在 PATH 中（在 GPU 机器上运行此脚本）")
+        print("  nvidia-smi is not available on PATH; run this check on the GPU host")
     except Exception as e:
         print(f"  {e}")
 
@@ -286,15 +285,15 @@ def benchmark_ttft():
     the FLOPs per layer → prefill (compute-bound) is faster on long prompts.
     """
     print("\n" + "=" * 60)
-    print("⏱️  TTFT 基准测试（首 token 时间）")
-    print("   TP 对长 prompt prefill 加速最显著（矩阵乘各 GPU 算一半 FLOP）")
+    print("⏱️  TTFT benchmark")
+    print("   Interpret results with model size, batch, topology, and baseline held constant")
     print("=" * 60)
 
     results = {}
     for name, prompt in PROMPTS.items():
         times       = []
         token_count = len(prompt.split())
-        print(f"\n[{name}] ~{token_count} 词 prompt", end="", flush=True)
+        print(f"\n[{name}] ~{token_count}-word prompt", end="", flush=True)
         for _ in range(5):
             t = measure_ttft(prompt, name)
             if t > 0:
@@ -303,17 +302,17 @@ def benchmark_ttft():
         if times:
             med           = statistics.median(times)
             results[name] = med
-            print(f"  中位 TTFT: {med*1000:.1f}ms  (min={min(times)*1000:.1f}ms)")
+            print(f"  median TTFT: {med*1000:.1f}ms  (min={min(times)*1000:.1f}ms)")
         else:
-            print("  失败")
+            print("  failed")
 
     return results
 
 
 def benchmark_throughput():
     print("\n" + "=" * 60)
-    print("🚀 并发吞吐测试（20 并发，medium prompt）")
-    print("   TP 主要解决「模型装得下」问题；decode 带宽收益有限")
+    print("🚀 Concurrent load test (20 medium prompts)")
+    print("   TP primarily enables models that do not fit on one GPU")
     print("=" * 60)
 
     prompt  = PROMPTS["medium"]
@@ -351,11 +350,11 @@ def benchmark_throughput():
                 print(f"  ❌ {ans}")
 
     total = time.time() - t_total
-    print(f"\n总耗时: {total:.1f}s  |  成功: {success}/20  |  失败: {fail}/20")
+    print(f"\nWall time: {total:.1f}s  |  success: {success}/20  |  failed: {fail}/20")
     if latencies:
         p95 = sorted(latencies)[int(len(latencies) * 0.95)]
         print(
-            f"延迟: P50={statistics.median(latencies)*1000:.0f}ms  "
+            f"Latency: P50={statistics.median(latencies)*1000:.0f}ms  "
             f"P95={p95*1000:.0f}ms"
         )
 
@@ -367,7 +366,7 @@ from _log_utils import print_hw_info, save_container_logs as _save_container_log
 
 def main():
     print("=" * 60)
-    print("🔬 RadixGates — Tensor Parallel (TP) 模式演示")
+    print("🔬 RadixGates — Tensor Parallel (TP) validation")
     print("   SGLang TP instance: GPU 0 + GPU 1 (:30000)")
     print(f"   Gateway: {GATEWAY_URL}")
     print("=" * 60)
@@ -380,10 +379,10 @@ def main():
     tp_ok, tp_size_found = check_tp_active()
 
     # GPU memory before benchmarks (baseline — model loaded, no active requests)
-    check_gpu_memory("基准（模型已加载，无请求）")
+    check_gpu_memory("baseline (model loaded, no active requests)")
 
     if not tp_ok:
-        print("\n⚠️  TP 未确认，仍继续跑基准（结果仅供参考）")
+        print("\n⚠️  TP was not confirmed; continuing, but treat results as diagnostic only")
 
     try:
         benchmark_ttft()
@@ -392,23 +391,21 @@ def main():
         pass
 
     # GPU memory after benchmarks (should be stable — TP doesn't cause memory leaks)
-    check_gpu_memory("测试后（应与基准相近）")
+    check_gpu_memory("after the load test")
 
     print("\n" + "=" * 60)
-    print("💡 结果解读：")
+    print("💡 Interpretation:")
     if tp_ok:
-        print(f"  tensor_parallel_size={tp_size_found} 已确认   → TP 生效 ✅")
+        print(f"  tensor_parallel_size={tp_size_found} confirmed ✅")
     else:
-        print("  API/log 未返回 tp_size，以显存分布作为依据：")
-        print("  若4 卡各占 ~22GB（32B 模型 64GB / 4 = 16GB/卡权重）→ TP 事实上生效 ✅")
-    print("  各卡显存均>50% → 权重已分片（模型超出单卡容量，必须开 TP）")
-    print("  long prompt TTFT 改善 → prefill 矩阵乘法两卡各算一半 FLOP")
-    print("  decode 带宽不翻倍   → All-Reduce 开销抵消部分收益，这是正常现象")
+        print("  tp_size was not exposed; memory distribution is supporting evidence only")
+    print("  Material allocation on every rank is consistent with weight sharding")
+    print("  Do not infer a TP speedup without a same-model, same-host baseline")
     print()
-    print("  TP vs PD 定位：")
-    print("    TP  — 模型大到单卡放不下时的必选项（解决显存问题）")
-    print("    PD  — 模型放得下，但 prefill/decode 互相抢资源时的优化")
-    print("    TP+PD — 工业级 70B+ 模型，两者叠加（如 DeepSeek-V3）")
+    print("  TP versus PD:")
+    print("    TP — shard a model that does not fit on one GPU")
+    print("    PD — separate prefill and decode resource pools")
+    print("    TP+PD — combine both when the deployment and model justify it")
     print("=" * 60)
 
     _ts = os.path.basename(_log_path).replace("tp_demo_", "").replace(".log", "") + f"_{hw_tag}"

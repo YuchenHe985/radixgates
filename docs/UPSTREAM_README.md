@@ -1,5 +1,7 @@
 # RadixGates — High-Performance Private LLM Inference Gateway
 
+> **Historical document.** This is the README delivered with the upstream project, with language normalized to English. Some benchmark statements below predate the reproducible result set and should not be treated as current evidence. Use [`real-gpu-results.md`](real-gpu-results.md) and the current repository [`README`](../README.md) for canonical results and caveats.
+
 **Prefix-Aware Routing · PD Disaggregation · Data / Tensor / Expert Parallelism · Direct SSE Streaming · Semaphore Backpressure · Prometheus Metrics**
 
 ---
@@ -18,7 +20,7 @@ It sits in front of SGLang inference engines and provides:
 4. **Semaphore Backpressure** — Go semaphore limits concurrent load per node; excess requests wait in goroutines with zero message loss
 5. **Direct SSE Streaming** — Token-by-token streaming from Gateway to client, no intermediate broker
 
-**Typical use case**: 中大型企业内部私有部署 — 员工通过企业内网访问 LLM，网关保证数据不出内网、GPU 不被打爆、请求零丢失。
+**Typical use case**: private enterprise deployment in which employees access an LLM over an internal network and the gateway protects GPU capacity while keeping requests and data inside the deployment boundary.
 
 ---
 
@@ -36,7 +38,7 @@ It sits in front of SGLang inference engines and provides:
 
 Key confirmations: `tensor_parallel_size=4`, `[TP0 EP0]~[TP3 EP3]` EP ranks, prefix-hash KV cache routing.
 
-Full results: [`docs/benchmark_parallel_modes.md`](docs/benchmark_parallel_modes.md)
+Canonical measured results and caveats: [`real-gpu-results.md`](real-gpu-results.md)
 
 ### PD Disaggregation (2× RTX 4090, verified 2026-04-25)
 
@@ -55,13 +57,13 @@ Full results: [`docs/benchmark_parallel_modes.md`](docs/benchmark_parallel_modes
 ## Parallelism Strategy
 
 ```
-模型放得进单卡?
-  ├─ YES → DP=N  (多副本, 线性扩 QPS, 零跨卡通信)
-  └─ NO  → TP=N  (权重切分, All-Reduce 每层)
-               └─ MoE 模型? → +EP=N (Expert 切分, All-to-All)
-                                └─ 超长流水线? → +PP (层间切分)
+Does the model fit on one GPU?
+  ├─ YES → DP=N  (replicas, higher aggregate QPS, no cross-GPU model communication)
+  └─ NO  → TP=N  (sharded weights, per-layer All-Reduce)
+               └─ MoE model? → +EP=N (expert sharding, All-to-All)
+                                └─ Very deep pipeline? → +PP (layer partitioning)
 
-工业实践: DP + TP + EP 叠加 (DeepSeek-V3 / Qwen3-235B 等)
+Large deployments may combine DP, TP, EP, and PP according to model and topology.
 ```
 
 | Mode | Splits | Communication | When to Use |
@@ -334,9 +336,9 @@ RadixGates/
 ├── mock_docs/                     # Sample documents used by the enterprise-QA demo
 ├── .env.example                   # Template for local environment variables (SSH_TARGET for log collection)
 ├── docs/
-│   ├── benchmark_parallel_modes.md  # DP/TP/EP verified benchmark results
+│   ├── real-gpu-results.md          # canonical DP/TP/EP measurements and caveats
 │   ├── troubleshooting/           # Failure-pattern playbooks (nvidia-docker, port conflicts, API flag changes, ...)
-│   └── lab-notes/                 # Experiment logs (4x RTX 4090, 4x A100) and GPU sizing notes
+│   └── deployment-reports/        # 4x RTX 4090 and 4x A100 engineering reports
 ├── docker-compose.dp.yml          # DP=4: 4 SGLang replicas, one per GPU  (gateway routing_mode=direct)
 ├── docker-compose.tp.yml          # TP=4: single SGLang, weights split across GPUs
 ├── docker-compose.ep.yml          # EP=4: MoE model, Expert routing across GPUs

@@ -1,20 +1,20 @@
 """
-enterprise_qa_demo.py — 企业内部智能问答并发压测
+enterprise_qa_demo.py — concurrent internal-assistant workload.
 
-架构：Client → Gateway → SGLang（直连，无 Kafka / Worker）
-与后端并行模式无关，适用于 DP / TP / EP 任意部署。
+Architecture: Client → Gateway → SGLang (direct HTTP; no Kafka or worker tier).
+The workload can run against DP, TP, or EP deployments.
 
-特性展示：
-  - 30 名员工同时提问（5 个部门，每部门 6 人）
-  - 每个部门有独立 system prompt → 不同 prefix_hash → consistent hash 路由
-  - Go 信号量限流（max_concurrent=8）防止 SGLang 被打爆
-  - 全部同步 HTTP，无 task_id 轮询，无 Kafka，无 WebSocket
+Workload:
+  - 30 concurrent users across five departments
+  - one system prompt per department to exercise prefix affinity
+  - gateway admission limits protect each SGLang worker
+  - synchronous HTTP with no task polling, Kafka, or WebSocket layer
 
-启动（本地 Docker）：
+Local Docker:
   docker compose -f docker-compose.yml up -d
   python3 examples/enterprise_qa_demo.py
 
-启动（裸机，no-Docker）：
+Bare metal:
   GATEWAY_URL=http://localhost:8081 python3 examples/enterprise_qa_demo.py
 """
 
@@ -45,7 +45,7 @@ class _Tee:
 sys.stdout = _Tee(sys.__stdout__, _log_file)
 print(f"[log → {_log_path}]")
 
-# 5 个部门 → 5 种 system prompt → 5 种 prefix_hash → 分散并发负载
+# Five departments produce five reusable system-prompt prefixes.
 DEPARTMENT_PROMPTS = {
     "Engineering": "You are a helpful AI assistant serving the Engineering department. Be concise and accurate.",
     "HR":          "You are a helpful AI assistant serving the HR department. Be concise and friendly.",
@@ -56,24 +56,24 @@ DEPARTMENT_PROMPTS = {
 DEPARTMENTS = list(DEPARTMENT_PROMPTS.keys())
 
 EMPLOYEE_QUESTIONS = [
-    # 考验知识库（RAG 命中）的问题
+    # Questions that can exercise a retrieval-backed deployment.
     "I want to know about the revolutionary RadixAttention approach.",
     "Which framework uses RadixAttention and what does it do?",
     "Where is the Eiffel Tower located and who built it?",
     "Could you tell me the capital of France?",
-    # 日常聊天
+    # General prompts.
     "Hello! Write a 1-sentence greeting for our team.",
     "How much is 1 + 1? Be concise.",
 ]
 
 
 def simulate_employee(employee_id: int):
-    """一名员工：选部门 → 提问 → 等直接回答。"""
+    """Submit one user request using a department-specific system prompt."""
     dept = DEPARTMENTS[employee_id % len(DEPARTMENTS)]
     system_prompt = DEPARTMENT_PROMPTS[dept]
     question = EMPLOYEE_QUESTIONS[employee_id % len(EMPLOYEE_QUESTIONS)]
 
-    # 轻微错峰，模拟真实用户行为
+    # Add jitter so requests do not all begin in the same scheduler tick.
     time.sleep(random.uniform(0, 2.0))
     start = time.time()
 
@@ -92,7 +92,7 @@ def simulate_employee(employee_id: int):
         )
 
         if resp.status_code != 200:
-            return False, f"[{dept}][员工 {employee_id}] ❌ HTTP {resp.status_code}: {resp.text[:100]}"
+            return False, f"[{dept}][user {employee_id}] ❌ HTTP {resp.status_code}: {resp.text[:100]}"
 
         data = resp.json()
         answer = data["choices"][0]["message"]["content"].strip()
@@ -100,13 +100,13 @@ def simulate_employee(employee_id: int):
         short_ans = answer[:80].replace("\n", " ")
         return (
             True,
-            f"[{dept}][员工 {employee_id}] 耗时 {latency:.2f}s ✅\n"
-            f"  提问: {question}\n"
-            f"  回答: {short_ans}\n" + "-" * 50,
+            f"[{dept}][user {employee_id}] latency {latency:.2f}s ✅\n"
+            f"  prompt: {question}\n"
+            f"  answer: {short_ans}\n" + "-" * 50,
         )
 
     except Exception as e:
-        return False, f"[{dept}][员工 {employee_id}] 💥 异常: {e}"
+        return False, f"[{dept}][user {employee_id}] 💥 error: {e}"
 
 
 from _log_utils import save_container_logs as _save_container_logs
@@ -117,25 +117,25 @@ def save_container_logs(ts: str):
 
 def main():
     print("=" * 60)
-    print("🌟 场景模拟：企业早高峰智能问答并发突增（Direct 模式）")
+    print("🌟 Internal-assistant concurrent workload (direct mode)")
     print(f"   Gateway: {GATEWAY_URL}")
     print("=" * 60)
 
-    # 确认 Gateway 模式
+    # Verify gateway mode.
     try:
         health = requests.get(f"{GATEWAY_URL}/health", timeout=5).json()
         mode = health.get("mode", "unknown")
         if mode != "direct":
-            print(f"⚠️  当前模式 {mode!r}，需要 'direct' 模式")
-            print("   请用 ROUTING_MODE=direct docker compose up 重启 Gateway")
+            print(f"⚠️  Current mode is {mode!r}; this demo requires 'direct'")
+            print("   Restart with ROUTING_MODE=direct docker compose up")
             sys.exit(1)
-        print(f"✅ Gateway 模式: {mode!r}  （无 Kafka，无 Worker）")
+        print(f"✅ Gateway mode: {mode!r} (no Kafka or worker tier)")
     except Exception as e:
-        print(f"❌ 无法连接 Gateway: {e}")
+        print(f"❌ Cannot reach gateway: {e}")
         sys.exit(1)
 
     NUM_EMPLOYEES = 30
-    print(f"\n👥 模拟 {NUM_EMPLOYEES} 名员工并发提问（{len(DEPARTMENTS)} 个部门）")
+    print(f"\n👥 Sending {NUM_EMPLOYEES} requests across {len(DEPARTMENTS)} departments")
     print("─" * 60)
 
     success_count = 0
@@ -154,13 +154,13 @@ def main():
 
     elapsed = time.time() - t_total
     print("=" * 60)
-    print("🎉 场景模拟结束（并发潮已消退）。")
-    print(f"   总耗时:  {elapsed:.1f}s")
-    print(f"   总员工:  {NUM_EMPLOYEES}")
-    print(f"   成功:    {success_count}")
-    print(f"   失败:    {fail_count}")
+    print("🎉 Workload complete.")
+    print(f"   Wall time: {elapsed:.1f}s")
+    print(f"   Requests:  {NUM_EMPLOYEES}")
+    print(f"   Success:   {success_count}")
+    print(f"   Failed:    {fail_count}")
     if fail_count == 0:
-        print("🏆 信号量限流完美运作：所有请求在等待池中有序处理，零丢失！")
+        print("✅ All submitted requests completed in this run.")
     print("=" * 60)
 
     _ts = os.path.basename(_log_path).replace("enterprise_qa_demo_", "").replace(".log", "")

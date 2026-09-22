@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# collect_docker_logs.sh — 把当前运行的 PD 容器日志保存到 examples/logs/
+# collect_docker_logs.sh — save logs from running PD containers to examples/logs/
 #
-# 用法：
-#   bash scripts/collect_docker_logs.sh            # 保存所有 PD 容器日志
-#   bash scripts/collect_docker_logs.sh --lines 200  # 只保留最近 200 行
+# Usage:
+#   bash scripts/collect_docker_logs.sh              # save all PD container logs
+#   bash scripts/collect_docker_logs.sh --lines 200  # keep only the latest 200 lines
 
 set -euo pipefail
 
-LINES="${2:-}"          # --lines N 可选
+LINES="${2:-}"          # optional: --lines N
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/../examples/logs"
 mkdir -p "$LOG_DIR"
@@ -18,7 +18,7 @@ CONTAINERS=(gateway sglang-router sglang-prefill sglang-decode)
 
 for cname in "${CONTAINERS[@]}"; do
     if ! docker ps --format '{{.Names}}' | grep -q "^${cname}$"; then
-        echo "  [skip] ${cname} 未运行"
+        echo "  [skip] ${cname} is not running"
         continue
     fi
 
@@ -32,5 +32,5 @@ for cname in "${CONTAINERS[@]}"; do
 done
 
 echo ""
-echo "日志已保存到 ${LOG_DIR}/"
+echo "Logs saved to ${LOG_DIR}/"
 ls -lh "${LOG_DIR}/"*"${TS}"* 2>/dev/null || true

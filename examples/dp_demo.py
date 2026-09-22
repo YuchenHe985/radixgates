@@ -1,29 +1,29 @@
 """
-dp_demo.py — Data Parallel (DP) 模式演示与验证
+dp_demo.py — Data Parallel (DP) validation and benchmark.
 
-架构：
-  GPU 0 (:30000) — 完整模型副本，独立 KV Cache
-  GPU 1 (:30001) — 完整模型副本，独立 KV Cache
-  GPU 2 (:30002) — 完整模型副本，独立 KV Cache
-  GPU 3 (:30003) — 完整模型副本，独立 KV Cache
-  Gateway (:8080) — prefix_hash % 4 → 一致性哈希路由
+Architecture:
+  GPU 0 (:30000) — full model replica with an independent KV cache
+  GPU 1 (:30001) — full model replica with an independent KV cache
+  GPU 2 (:30002) — full model replica with an independent KV cache
+  GPU 3 (:30003) — full model replica with an independent KV cache
+  Gateway (:8080) — prefix_hash % 4 affinity routing
 
-  DP 的核心特性：
-    零 GPU 间通信（无 All-Reduce / All-to-All）
-    4× 并发吞吐（4 个 GPU 同时处理不同 batch）
-    KV Cache 局部性（相同 system prompt → 相同 GPU → Cache 命中）
+  DP properties:
+    no cross-GPU model collectives (no All-Reduce or All-to-All)
+    four replicas can process independent batches concurrently
+    prefix affinity can preserve KV-cache locality
 
-  与其他并行的对比：
-    DP — 多副本，解决 QPS；模型要能装进单卡
-    TP — 权重切分，解决模型太大；需要 NVLink All-Reduce
-    EP — Expert 切分（MoE 专属），解决 Expert 显存；需要 All-to-All
+  Comparison:
+    DP — replicas for aggregate throughput; each model must fit on one GPU
+    TP — weight sharding for larger dense models; requires All-Reduce
+    EP — expert sharding for MoE models; requires All-to-All
 
-启动方式：
+Launch:
   docker compose -f docker-compose.dp.yml up -d
   python3 examples/dp_demo.py
 
-推荐机器（Vast.ai）：
-  4× A100 80 GB SXM — MODEL_PATH=Qwen/Qwen2.5-14B-Instruct（默认，28GB fit in 80GB）
+Example host:
+  4× A100 80 GB SXM — MODEL_PATH=Qwen/Qwen2.5-14B-Instruct (default; ~28 GB weights)
 """
 
 import concurrent.futures
@@ -89,7 +89,7 @@ def check_gateway():
         mode = r.json().get("mode", "unknown")
         print(f"✅ Gateway: mode={mode!r}")
     except Exception as e:
-        print(f"❌ Gateway 连不上: {e}")
+        print(f"❌ Cannot reach gateway: {e}")
         sys.exit(1)
 
 
@@ -102,7 +102,7 @@ def check_all_nodes() -> int:
     All 4 must be healthy before Gateway starts routing.
     """
     print("\n" + "=" * 60)
-    print("🔍 DP 验证 — 4 个 SGLang 节点健康检查")
+    print("🔍 DP validation — health check for four SGLang workers")
     print("=" * 60)
 
     healthy = 0
@@ -116,7 +116,7 @@ def check_all_nodes() -> int:
             tp    = info.get("tp_size", info.get("tensor_parallel_size", 1))
             mark  = "✅" if ok else "❌"
             print(f"  {mark} GPU {node['gpu']} [{node['name']}]  {node['url']}")
-            print(f"       model={model}  tp_size={tp} (DP 每节点独立，无跨卡通信)")
+            print(f"       model={model}  tp_size={tp} (independent DP worker)")
             if ok:
                 healthy += 1
         except Exception as e:
@@ -124,9 +124,9 @@ def check_all_nodes() -> int:
 
     print()
     if healthy == len(DP_NODES):
-        print(f"  ✅ 全部 {healthy}/{len(DP_NODES)} 节点健康 — DP={healthy} 已就绪")
+        print(f"  ✅ {healthy}/{len(DP_NODES)} workers healthy — DP={healthy} ready")
     else:
-        print(f"  ⚠️  {healthy}/{len(DP_NODES)} 节点健康 — 部分节点未就绪")
+        print(f"  ⚠️  {healthy}/{len(DP_NODES)} workers healthy — deployment not fully ready")
 
     return healthy
 
@@ -137,8 +137,8 @@ def check_gpu_memory() -> None:
     (each holds a complete model copy, no weight sharing between GPUs).
     """
     print("\n" + "=" * 60)
-    print("🖥️  GPU 显存占用（DP 模式：4 卡各持完整模型副本）")
-    print("   显存占用应四卡一致（相同模型大小），无跨卡权重依赖")
+    print("🖥️  GPU memory (DP: one full model replica per GPU)")
+    print("   Similar baseline allocation is expected across the four replicas")
     print("=" * 60)
 
     try:
@@ -161,19 +161,19 @@ def check_gpu_memory() -> None:
             bar     = "█" * filled + "░" * (bar_len - filled)
             gpu_ok  = pct > 10
             usages.append(pct)
-            mark    = "✅" if gpu_ok else "○ (空闲)"
+            mark    = "✅" if gpu_ok else "○ (idle)"
             print(f"  GPU {idx} [{name}]")
             print(f"    {bar}  {used}/{total} MB  ({pct:.1f}%)  {mark}")
 
         if len(usages) >= 4:
             diff = max(usages) - min(usages)
-            sym  = "对称" if diff < 5 else f"差 {diff:.1f}%（正常，KV Cache 大小不同）"
+            sym  = "balanced" if diff < 5 else f"{diff:.1f}% spread (KV-cache occupancy may differ)"
             print()
-            print(f"  → 四卡显存分布：{sym}")
-            print(f"  → DP 确认：各卡独立持有完整模型，无权重切分  ✅")
+            print(f"  → Memory distribution: {sym}")
+            print("  → DP check: each GPU holds an independent full model replica ✅")
 
     except FileNotFoundError:
-        print("  nvidia-smi 不在 PATH 中")
+        print("  nvidia-smi is not available on PATH")
     except Exception as e:
         print(f"  {e}")
 
@@ -192,12 +192,12 @@ def test_prefix_hash_routing() -> None:
     - Repeat requests with same prefix → KV Cache hit on that node → faster TTFT
     """
     print("\n" + "=" * 60)
-    print("🗺️  Prefix-Hash 路由验证")
-    print("   相同 system prompt → 相同 GPU → KV Cache 命中")
+    print("🗺️  Prefix-affinity routing check")
+    print("   Repeat each system prompt and compare cold versus warm TTFT")
     print("=" * 60)
 
     # Round 1: cold requests (no cache)
-    print("\n[Round 1] 冷启动（无缓存）— 4 个不同 prefix，同时发送")
+    print("\n[Round 1] Cold cache — send four different prefixes concurrently")
     cold_times = {}
 
     def send(sys_prompt: str, label: str) -> tuple[str, float]:
@@ -244,7 +244,7 @@ def test_prefix_hash_routing() -> None:
             print(f"  {label}: TTFT={ttft*1000:.1f}ms")
 
     # Round 2: warm requests (same prefixes → cache hit on same nodes)
-    print("\n[Round 2] 热缓存（相同 prefix 再发一次，应命中 KV Cache）")
+    print("\n[Round 2] Warm cache — repeat the same prefixes")
     warm_times = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
@@ -257,15 +257,15 @@ def test_prefix_hash_routing() -> None:
             warm_times[label] = ttft
             cold = cold_times.get(label, 0)
             improvement = (cold - ttft) / max(cold, 0.001) * 100
-            hit_mark = "🔥 Cache Hit" if ttft < cold * 0.85 else "— 无明显差异"
-            print(f"  {label}: TTFT={ttft*1000:.1f}ms  (冷={cold*1000:.1f}ms  {improvement:+.0f}%)  {hit_mark}")
+            hit_mark = "🔥 likely cache hit" if ttft < cold * 0.85 else "— no material difference"
+            print(f"  {label}: TTFT={ttft*1000:.1f}ms  (cold={cold*1000:.1f}ms  {improvement:+.0f}%)  {hit_mark}")
 
     print()
     if all(warm_times[k] < cold_times[k] * 0.9 for k in cold_times):
-        print("  ✅ KV Cache 命中确认：warm TTFT 显著低于 cold TTFT")
-        print("     prefix-hash 路由将相同 prefix 始终路由到同一 GPU")
+        print("  ✅ Warm TTFT is materially below cold TTFT")
+        print("     The result is consistent with prefix affinity preserving cache locality")
     else:
-        print("  ℹ️  TTFT 差异不显著（可能模型已预热，或 prefix 较短）")
+        print("  ℹ️  TTFT difference is not material; the prefix may be short or already warm")
 
 
 # ── Throughput Benchmark ──────────────────────────────────────────────────────
@@ -279,9 +279,8 @@ def benchmark_throughput():
     No inter-GPU communication means perfect linear scaling with request count.
     """
     print("\n" + "=" * 60)
-    print("🚀 并发吞吐测试（40 并发，4 种 prefix 均匀分布）")
-    print("   DP 理想情况：40 并发耗时 ≈ 单 GPU 处理 10 请求耗时")
-    print("   零跨卡通信 → 近线性扩展")
+    print("🚀 Concurrent load test (40 requests across four prefixes)")
+    print("   Four independent replicas serve separate requests without model collectives")
     print("=" * 60)
 
     # Cycle through 4 system prompts so requests distribute across all 4 nodes
@@ -325,17 +324,17 @@ def benchmark_throughput():
                 print(f"  ❌ {ans}")
 
     total = time.time() - t_total
-    print(f"\n总耗时: {total:.1f}s  |  成功: {success}/40  |  失败: {fail}/40")
+    print(f"\nWall time: {total:.1f}s  |  success: {success}/40  |  failed: {fail}/40")
     if latencies:
         p50 = statistics.median(latencies)
         p95 = sorted(latencies)[int(len(latencies) * 0.95)]
-        print(f"延迟: P50={p50*1000:.0f}ms  P95={p95*1000:.0f}ms")
+        print(f"Latency: P50={p50*1000:.0f}ms  P95={p95*1000:.0f}ms")
         # DP scaling estimate
         single_node_est = total * 4
-        print(f"\n📊 DP 扩展效果估算：")
-        print(f"  40 并发实际耗时 : {total:.1f}s")
-        print(f"  单 GPU 预计耗时 : ~{single_node_est:.1f}s (40请求顺序处理)")
-        print(f"  DP=4 加速比     : ~{single_node_est/max(total,0.1):.1f}×")
+        print("\n📊 Illustrative DP scaling estimate (not a measured single-GPU baseline):")
+        print(f"  Measured wall time for 40 concurrent requests: {total:.1f}s")
+        print(f"  Sequential estimate from this run: ~{single_node_est:.1f}s")
+        print(f"  Estimated ratio: ~{single_node_est/max(total,0.1):.1f}×")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -345,10 +344,10 @@ from _log_utils import print_hw_info, save_container_logs as _save_container_log
 
 def main():
     print("=" * 60)
-    print("🔬 RadixGates — Data Parallel (DP=4) 模式演示")
+    print("🔬 RadixGates — Data Parallel (DP=4) validation")
     print("   GPU 0 (:30000)  GPU 1 (:30001)")
     print("   GPU 2 (:30002)  GPU 3 (:30003)")
-    print("   各卡独立完整副本，零跨卡通信")
+    print("   One independent model replica per GPU")
     print(f"   Gateway: {GATEWAY_URL}")
     print("=" * 60)
 
@@ -358,7 +357,7 @@ def main():
 
     healthy = check_all_nodes()
     if healthy < len(DP_NODES):
-        print(f"\n⚠️  {len(DP_NODES) - healthy} 个节点未就绪，仍继续（部分结果）")
+        print(f"\n⚠️  {len(DP_NODES) - healthy} workers are not ready; continuing with partial results")
 
     check_gpu_memory()
 
@@ -369,15 +368,15 @@ def main():
         pass
 
     print("\n" + "=" * 60)
-    print("💡 结果解读：")
-    print("  4 节点全部健康         → DP=4 正常运行 ✅")
-    print("  warm TTFT < cold TTFT  → prefix-hash 路由命中同一节点的 KV Cache ✅")
-    print("  40 并发耗时 ≈ 10 请求  → 4× 吞吐扩展，零通信开销 ✅")
+    print("💡 Interpretation:")
+    print("  Four healthy workers establish that DP=4 is ready")
+    print("  Warm-versus-cold TTFT checks whether affinity preserves cache locality")
+    print("  The 40-request result is measured; the scaling ratio above is only an estimate")
     print()
-    print("  DP vs TP vs EP 在 4× A100 上的选择：")
-    print("    DP=4  — 14B/32B 模型，最大化 QPS，零 GPU 通信（本 demo）")
-    print("    TP=4  — 70B 模型，单卡放不下时，All-Reduce 走 NVLink")
-    print("    EP=4  — MoE 模型（Qwen3-30B-A3B），All-to-All 路由 Expert")
+    print("  Choosing a parallel mode:")
+    print("    DP — replicate a model that fits on one GPU for aggregate throughput")
+    print("    TP — shard dense weights when a model does not fit on one GPU")
+    print("    EP — shard experts in an MoE model and route tokens with All-to-All")
     print("=" * 60)
 
     _ts = os.path.basename(_log_path).replace("dp_demo_", "").replace(".log", "") + f"_{hw_tag}"

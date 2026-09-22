@@ -25,7 +25,7 @@ def chat_stream_ttft(context_text, question, port=30000):
             for line in response:
                 if line.strip() and first_chunk_time is None:
                     first_chunk_time = time.time()
-                    break # 我们只关心 TTFT
+                    break  # TTFT only
         ttft_ms = (first_chunk_time - t0) * 1000 if first_chunk_time else 0
         return ttft_ms
     except Exception as e:
@@ -61,7 +61,7 @@ print("==============================================================")
 
 base_text = "The RadixAttention mechanism developed by SGLang dramatically optimizes inference in LLMs by utilizing a radix tree to manage the Key-Value (KV) cache. Instead of recalculating the attention scores for identical prefixes across multiple requests, the system intelligently hashes and retrieves previously computed states. This approach is highly effective in Retrieval-Augmented Generation (RAG) paradigms, where the same large document or system prompt is frequently prepended to varying user queries. "
 
-# 构造不同规模的测试上下文
+# Build test contexts at several sizes.
 context_map = {
     "2K": base_text * 40,   # roughly 2000+ tokens
     "4K": base_text * 80,   # roughly 4000+ tokens
@@ -74,7 +74,7 @@ results_summary = []
 
 for label, ctx in context_map.items():
     print(f"\n[ Testing Context Size: {label} ]")
-    # 为了保证冷启动是纯天然的（以防以前测试跑过同样的），我们在前面动态塞入当前标签和时间戳来破坏前缀缓存的碰撞
+    # Add a label and timestamp so a prior run cannot satisfy this cold-cache request.
     ctx_unique = f"Unique_Run_ID: {label}_{time.time()} \n" + ctx
     
     print(f"  👉 Running Cold...")
@@ -90,11 +90,11 @@ for label, ctx in context_map.items():
         ttft = chat_stream_ttft(ctx_unique, question)
         if ttft: 
             warm_ttft_list.append(ttft)
-        time.sleep(0.1)  # 稍微停顿一下
+        time.sleep(0.1)  # Briefly separate requests.
     
     avg_warm_ttft = sum(warm_ttft_list) / len(warm_ttft_list) if warm_ttft_list else 0
     
-    # 最后发一个非流式请求去拿到 SGLang API 返回的确切输入 token 数和 cache 命中数
+    # Finish with a non-streaming request to read exact input-token and cache-hit counts from SGLang.
     cached_tokens, total_tokens = chat_non_stream_for_tokens(ctx_unique, question)
     
     speedup = cold_ttft / avg_warm_ttft if avg_warm_ttft > 0 else 0

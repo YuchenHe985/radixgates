@@ -3,7 +3,7 @@
 Data: [`benchmarks/results/real_gpu/sglang_parallelism_runs.csv`](../benchmarks/results/real_gpu/sglang_parallelism_runs.csv).
 All runs were done by me on rented machines on 2026-07-27, with RadixGates as delivered (git tag
 `upstream-snapshot`) in front of SGLang. The numbers come from my own experiment logs (one run per
-cell, demo-script output); the condensed engineering reports are the [RTX 4090 deployment report](lab-notes/实验记录4090.md) and [A100 deployment report](lab-notes/实验记录A100.md).
+cell, demo-script output); the condensed engineering reports are the [RTX 4090 deployment report](deployment-reports/rtx-4090.md) and [A100 deployment report](deployment-reports/a100-sxm4.md).
 
 ## Results
 

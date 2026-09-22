@@ -84,7 +84,7 @@ Run the partition load balancing test:
 ```bash
 # On local Mac (with SSH tunnel to M1:8080 open):
 python3 examples/enterprise_qa_demo.py
-# Expected: 成功: 30  失败: 0
+# Expected: success: 30  failed: 0
 # Requests spread across both machines by prefix-hash
 ```
 

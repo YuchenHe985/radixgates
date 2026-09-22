@@ -2,6 +2,8 @@
 
 [![ci](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml/badge.svg)](https://github.com/YuchenHe985/radixgates/actions/workflows/ci.yml) ![Go 1.23](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white)
 
+[Chinese overview](README.zh-CN.md) · English is the primary language for code and technical documentation.
+
 RadixGates is a Go gateway in front of SGLang. It routes each request by its system-prompt prefix so a node's KV cache is reused,
 and spreads load across data-parallel replicas and prefill/decode nodes. This repository has three parts: the delivered project,
 my multi-GPU evaluation of it on 4x RTX 4090 and 4x A100 machines, and a reliability upgrade (health-aware failover, circuit breaking,
@@ -48,8 +50,8 @@ tenant quotas, or audit-log sink; request bodies are capped at **4 MiB**, and `/
 restrict the admin and metrics routes, and pin container images/model revisions instead of using `latest`. The gateway accepts both the historical `POST /v1/chat` route and
 the standard `POST /v1/chat/completions` route. See [docs/OPERATING.md](docs/OPERATING.md) for the controls that are implemented.
 
-**Provenance.** The original gateway, its README and the deployment runbooks come from a project my mentor assigned (UnicoreGPU team); they
-are preserved in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
+**Provenance.** The original gateway, README and deployment runbooks come from a project my mentor assigned (UnicoreGPU team); the historical
+README is retained, with language normalized to English, in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
 is mine: `git diff upstream-snapshot`. Order of work: the real-GPU runs came first (2026-07-27, see [data](benchmarks/results/real_gpu/sglang_parallelism_runs.csv)),
 then the gateway upgrade and the failure-injection benchmark. Design and failure modes: [docs/RELIABILITY.md](docs/RELIABILITY.md). Running it (alerts, settings, troubleshooting): [docs/OPERATING.md](docs/OPERATING.md).
 
@@ -171,7 +173,7 @@ TP=4, EP=4 and PD modes and diagnosed the failures that came up (CUDA image vs d
 a wedged GPU). Highlights: 4090 DP=4, Llama-3-8B, 40 concurrent requests, 40/40 succeeded, P50 1,215 ms / P95 2,300 ms, repeated-prefix time
 to first token 38-62 ms warm vs 87-113 ms cold; A100 TP=4 P50 2,754 ms and EP=4 846 ms against 4,836 ms and 1,653 ms on the 4090 box, which is
 **not** a clean NVLink-vs-PCIe comparison (different SGLang version, driver, deployment, and NCCL P2P disabled on the 4090 TP/EP runs).
-Data and caveats: [docs/real-gpu-results.md](docs/real-gpu-results.md); deployment reports: [`4× RTX 4090`](docs/lab-notes/实验记录4090.md), [`4× A100-SXM4`](docs/lab-notes/实验记录A100.md).
+Data and caveats: [docs/real-gpu-results.md](docs/real-gpu-results.md); deployment reports: [`4× RTX 4090`](docs/deployment-reports/rtx-4090.md), [`4× A100-SXM4`](docs/deployment-reports/a100-sxm4.md).
 The companion tool [llm-serving-eval-kit](https://github.com/YuchenHe985/llm-serving-eval-kit) turns those findings into a sizing estimator, a log
 diagnoser and a confounder-aware benchmark comparison.
 

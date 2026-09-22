@@ -1,9 +1,10 @@
 """
-_log_utils.py — 容器日志收集 + 硬件信息打印（供 demo 脚本调用）
+_log_utils.py — container-log collection and hardware summaries for the demos.
 
-优先尝试本地 docker；本地不可用时通过 SSH_TARGET 环境变量 SSH 到远端收集。
+Use the local Docker daemon when available. Otherwise, collect logs from the
+remote host configured by SSH_TARGET.
 
-SSH_TARGET 格式：user@host 或 user@host:port，例如：
+SSH_TARGET format: user@host or user@host:port, for example:
   SSH_TARGET="root@203.0.113.10:22" python3 examples/pd_demo.py
 """
 
@@ -37,7 +38,7 @@ def print_hw_info() -> str:
     the exact hardware used — essential when comparing 4090 vs H100 benchmarks.
     """
     print("\n" + "=" * 60)
-    print("🖥️  硬件信息")
+    print("🖥️  Hardware")
     print("=" * 60)
 
     gpu_names  = []
@@ -61,7 +62,7 @@ def print_hw_info() -> str:
             print(f"  GPU {idx}: {name}  ({int(mem)//1024} GB)")
         gpu_count = len(gpu_names)
     except Exception as e:
-        print(f"  nvidia-smi 不可用: {e}")
+        print(f"  nvidia-smi unavailable: {e}")
 
     # ── Interconnect type ─────────────────────────────────────────────────────
     # nvidia-smi topo -m prints a matrix; "NV" prefix means NVLink,
@@ -76,14 +77,14 @@ def print_hw_info() -> str:
     except Exception:
         link_type = "PCIe (assumed)"
 
-    print(f"\n  GPU 数量    : {gpu_count}")
-    print(f"  互联方式    : {link_type}")
+    print(f"\n  GPU count    : {gpu_count}")
+    print(f"  Interconnect : {link_type}")
 
     if link_type.startswith("NVLink"):
-        print("  → All-Reduce (TP) 和 All-to-All (EP) 带宽充足，加速比接近线性")
+        print("  → NVLink is available for TP All-Reduce and EP All-to-All traffic")
     else:
-        print("  → PCIe 互联：TP All-Reduce 每层有额外延迟，加速比低于 NVLink")
-        print("     EP All-to-All 影响相对小（只在 MoE Expert 层触发）")
+        print("  → PCIe topology detected; measure collective overhead on this host")
+        print("     because TP/EP behavior depends on the model, batch, and NCCL path")
 
     # ── Machine tag for log filenames ─────────────────────────────────────────
     if gpu_names:
@@ -99,13 +100,13 @@ def print_hw_info() -> str:
 
     link_tag = "NVLink" if "NVLink" in link_type else "PCIe"
     tag      = f"{gpu_count}x{short_name}_{link_tag}"
-    print(f"\n  机器标识    : {tag}  (写入 log 文件名)")
+    print(f"\n  Host tag     : {tag}  (included in the log filename)")
     print("=" * 60)
     return tag
 
 
 def _docker_local_ok() -> bool:
-    """检查本地 docker daemon 是否可用。"""
+    """Return whether the local Docker daemon is available."""
     if not shutil.which("docker"):
         return False
     r = subprocess.run(["docker", "info"], capture_output=True)
@@ -129,7 +130,7 @@ def _save_via_local(log_dir: str, ts: str) -> list[str]:
 
 
 def _save_via_ssh(log_dir: str, ts: str, ssh_target: str) -> list[str]:
-    """通过 SSH 在远端运行 docker logs，把输出拉到本地。"""
+    """Run docker logs over SSH and return the remote output."""
     parts = ssh_target.rsplit(":", 1)
     host = parts[0]
     port = parts[1] if len(parts) == 2 else "22"
@@ -156,7 +157,7 @@ def _save_via_ssh(log_dir: str, ts: str, ssh_target: str) -> list[str]:
 
 
 def _load_env_file() -> None:
-    """从项目根目录的 .env 文件加载 SSH_TARGET（若环境变量未设置）。"""
+    """Load SSH_TARGET from the repository .env when the variable is unset."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env_path = os.path.join(root, ".env")
     if not os.path.exists(env_path):
@@ -175,8 +176,9 @@ def _load_env_file() -> None:
 
 def save_container_logs(log_dir: str, ts: str) -> None:
     """
-    把容器日志保存到 log_dir。
-    本地 docker 可用时直接读；否则尝试 SSH_TARGET（环境变量或项目根 .env 文件）。
+    Save container logs to log_dir.
+    Read the local Docker daemon when available; otherwise use SSH_TARGET from
+    the environment or repository .env file.
     """
     _load_env_file()
 
@@ -185,14 +187,14 @@ def save_container_logs(log_dir: str, ts: str) -> None:
     else:
         ssh_target = os.environ.get("SSH_TARGET", "")
         if not ssh_target:
-            print("\n[容器日志] 本地 docker 不可用，可通过以下任一方式配置：")
-            print("  1. 永久：echo 'export SSH_TARGET=\"root@203.0.113.10:22\"' >> ~/.zshrc")
-            print("  2. 项目：echo 'SSH_TARGET=root@203.0.113.10:22' >> .env")
+            print("\n[container logs] Local Docker is unavailable. Configure either:")
+            print("  1. Shell: echo 'export SSH_TARGET=\"root@203.0.113.10:22\"' >> ~/.zshrc")
+            print("  2. Project: echo 'SSH_TARGET=root@203.0.113.10:22' >> .env")
             return
         saved = _save_via_ssh(log_dir, ts, ssh_target)
 
     if saved:
-        print("\n[容器日志已保存]")
+        print("\n[container logs saved]")
         print("\n".join(saved))
     else:
-        print("\n[容器日志] 未找到运行中的 PD 容器，跳过。")
+        print("\n[container logs] No running PD containers found; skipping.")

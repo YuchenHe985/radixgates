@@ -1,18 +1,17 @@
 """
-pd_demo.py — PD (Prefill-Decode) 分离模式演示与基准测试
+pd_demo.py — Prefill/decode (PD) disaggregation validation and benchmark.
 
-架构：
-  GPU 0 → SGLang Prefill Server (:30000)  — 计算密集型，只做 prompt 处理
-  GPU 1 → SGLang Decode Server  (:30001)  — 带宽密集型，只做 token 生成
-  Gateway (:8080)               — 路由到 Decode Server（请求入口）
+Architecture:
+  GPU 0 → SGLang prefill server (:30000) — prompt processing
+  GPU 1 → SGLang decode server  (:30001) — token generation
+  Gateway (:8080)               — request entry point
 
-启动方式：
-  docker compose -f docker-compose.pd.yml up -d                                 # mooncake 默认（推荐）
-  PREFILL_BACKEND=mooncake DECODE_BACKEND=fake docker compose -f docker-compose.pd.yml up -d  # 快速路由验证
+Launch:
+  docker compose -f docker-compose.pd.yml up -d                                 # mooncake default
+  PREFILL_BACKEND=mooncake DECODE_BACKEND=fake docker compose -f docker-compose.pd.yml up -d  # routing-only check
 
-对比基准（同一模型，combined 模式 vs PD 分离）：
-  Combined：prefill 和 decode 在同一 GPU 互相抢资源
-  PD 分离： prefill 独占计算资源，decode 独占带宽资源
+For a controlled comparison, run the same model and prompts in combined and
+disaggregated modes and report both results.
 """
 
 import concurrent.futures
@@ -46,8 +45,7 @@ class _Tee:
 sys.stdout = _Tee(sys.__stdout__, _log_file)
 print(f"[log → {_log_path}]")
 
-# 不同长度的 prompt 用于测试 TTFT（首 token 时间）
-# PD 分离对长 prompt 的 TTFT 改善最明显（prefill 计算密集）
+# Prompt lengths used to measure time to first token (TTFT).
 PROMPTS = {
     "short":  "Say hi.",
     "medium": "Explain what a GPU is in 3 sentences.",
@@ -73,19 +71,19 @@ def check_gateway():
         mode = health.get("mode", "unknown")
         print(f"✅ Gateway: mode={mode!r}")
         if mode != "direct":
-            print("⚠️  Gateway 需要 routing_mode=direct (配置中 sglang_instances 指向 decode server)")
+            print("⚠️  Gateway must use routing_mode=direct with sglang_instances pointing to the decode server")
             sys.exit(1)
     except Exception as e:
-        print(f"❌ Gateway 连不上: {e}")
+        print(f"❌ Cannot reach gateway: {e}")
         sys.exit(1)
 
 
 def measure_ttft(prompt: str, label: str) -> float:
-    """测量 TTFT（首 token 时间），使用流式 API。"""
+    """Measure TTFT with the streaming API."""
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
-        "max_tokens": 1,  # 只要第一个 token
+        "max_tokens": 1,  # Only the first token is needed for TTFT.
     }
     t_start = time.time()
     ttft = None
@@ -120,17 +118,17 @@ def measure_ttft(prompt: str, label: str) -> float:
 
 
 def benchmark_ttft():
-    """TTFT 基准：短/中/长 prompt，每个测 5 次取中位数。"""
+    """Measure median TTFT over five short, medium, and long prompt runs."""
     print("\n" + "=" * 60)
-    print("⏱️  TTFT 基准测试（首 token 时间）")
-    print("   PD 分离对长 prompt 的 TTFT 改善最显著")
+    print("⏱️  TTFT benchmark")
+    print("   Report these values beside a separately measured combined-mode baseline")
     print("=" * 60)
 
     results = {}
     for name, prompt in PROMPTS.items():
         times = []
         token_count = len(prompt.split())
-        print(f"\n[{name}] ~{token_count} 词 prompt", end="", flush=True)
+        print(f"\n[{name}] ~{token_count}-word prompt", end="", flush=True)
         for _ in range(5):
             t = measure_ttft(prompt, name)
             if t > 0:
@@ -139,17 +137,17 @@ def benchmark_ttft():
         if times:
             med = statistics.median(times)
             results[name] = med
-            print(f"  中位 TTFT: {med*1000:.1f}ms  (min={min(times)*1000:.1f}ms)")
+            print(f"  median TTFT: {med*1000:.1f}ms  (min={min(times)*1000:.1f}ms)")
         else:
-            print("  失败")
+            print("  failed")
 
     return results
 
 
 def benchmark_throughput():
-    """并发吞吐：30 个请求同时发，测总耗时和成功率。"""
+    """Send 30 concurrent requests and report wall time and success count."""
     print("\n" + "=" * 60)
-    print("🚀 并发吞吐测试（30 并发，medium prompt）")
+    print("🚀 Concurrent load test (30 medium prompts)")
     print("=" * 60)
 
     prompt = PROMPTS["medium"]
@@ -187,9 +185,9 @@ def benchmark_throughput():
                 print(f"  ❌ {ans}")
 
     total = time.time() - t_total
-    print(f"\n总耗时: {total:.1f}s  |  成功: {success}/30  |  失败: {fail}/30")
+    print(f"\nWall time: {total:.1f}s  |  success: {success}/30  |  failed: {fail}/30")
     if latencies:
-        print(f"延迟: P50={statistics.median(latencies)*1000:.0f}ms  "
+        print(f"Latency: P50={statistics.median(latencies)*1000:.0f}ms  "
               f"P95={sorted(latencies)[int(len(latencies)*0.95)]*1000:.0f}ms")
 
 
@@ -201,18 +199,18 @@ def save_container_logs(ts: str):
 
 def main():
     print("=" * 60)
-    print("🔬 RadixGates — PD 分离模式演示")
+    print("🔬 RadixGates — prefill/decode disaggregation validation")
     print("   Prefill: GPU 0 (:30000)  Decode: GPU 1 (:30001)")
     print(f"   Gateway: {GATEWAY_URL}")
     print("=" * 60)
 
     check_gateway()
 
-    print("\n启动方式对照：")
+    print("\nLaunch options:")
     print("  docker compose -f docker-compose.pd.yml up -d")
-    print("    → mooncake 默认，RTX 4090 via PCIe（推荐）")
+    print("    → mooncake transfer backend")
     print("  PREFILL_BACKEND=mooncake DECODE_BACKEND=fake docker compose -f docker-compose.pd.yml up -d")
-    print("    → 仅验证路由流程，不实际传输 KV cache")
+    print("    → routing-only validation; no real KV-cache transfer")
 
     try:
         benchmark_ttft()
@@ -221,9 +219,9 @@ def main():
         pass
 
     print("\n" + "=" * 60)
-    print("💡 结果解读：")
-    print("  long prompt TTFT 显著低于 combined 模式 → PD 分离有效")
-    print("  throughput 与 combined 相当或更高 → GPU 利用率提升")
+    print("💡 Interpretation:")
+    print("  Compare TTFT and throughput with a same-model combined-mode baseline")
+    print("  This script alone validates the PD path; it does not establish a speedup")
     print("=" * 60)
 
     _ts = os.path.basename(_log_path).replace("pd_demo_", "").replace(".log", "")

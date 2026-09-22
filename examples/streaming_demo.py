@@ -1,14 +1,14 @@
 """
-streaming_demo.py — RadixGates Gateway 流式响应演示（SSE / streaming）。
+streaming_demo.py — RadixGates SSE streaming check.
 
-架构：Client → Gateway → SGLang（直连 SSE，无 Kafka / WebSocket / task_id）
-与后端并行模式无关，适用于 DP / TP / EP 任意部署。
+Architecture: Client → Gateway → SGLang (direct SSE; no Kafka, WebSocket, or task polling).
+The check can run against DP, TP, or EP deployments.
 
-启动（本地 Docker）：
+Local Docker:
   docker compose -f docker-compose.yml up -d
   python3 examples/streaming_demo.py
 
-启动（裸机，no-Docker）：
+Bare metal:
   GATEWAY_URL=http://localhost:8081 python3 examples/streaming_demo.py
 """
 
@@ -47,23 +47,23 @@ def check_mode():
         r = requests.get(f"{GATEWAY_URL}/health", timeout=5)
         mode = r.json().get("mode", "unknown")
         if mode != "direct":
-            print(f"⚠️  Gateway 当前模式: {mode!r}，不是 'direct'")
-            print("   请用 ROUTING_MODE=direct docker compose up 重启 Gateway")
+            print(f"⚠️  Gateway mode is {mode!r}; expected 'direct'")
+            print("   Restart with ROUTING_MODE=direct docker compose up")
             sys.exit(1)
     except Exception as e:
-        print(f"❌ 无法连接 Gateway ({GATEWAY_URL}): {e}")
+        print(f"❌ Cannot reach gateway ({GATEWAY_URL}): {e}")
         sys.exit(1)
 
 
 def stream_chat(question: str):
-    """POST /v1/chat (stream=true) → 逐 token 打印到终端。"""
+    """POST /v1/chat with stream=true and print each SSE token."""
     payload = {
         "model": "NousResearch/Meta-Llama-3-8B-Instruct",
         "messages": [{"role": "user", "content": question}],
         "stream": True,
     }
 
-    print("\n[Gateway → SGLang 直连，实时 SSE token 流]\n")
+    print("\n[Gateway → SGLang direct SSE stream]\n")
     print("─" * 50)
 
     start = time.time()
@@ -103,9 +103,9 @@ def stream_chat(question: str):
 
     elapsed = time.time() - start
     print(f"\n{'─'*50}")
-    print(f"✅ 完成  |  耗时: {elapsed:.2f}s  |  ~{token_count} tokens")
+    print(f"✅ Complete  |  elapsed: {elapsed:.2f}s  |  ~{token_count} tokens")
     if elapsed > 0:
-        print(f"   吞吐: ~{token_count/elapsed:.1f} tokens/s")
+        print(f"   Throughput: ~{token_count/elapsed:.1f} tokens/s")
 
 
 from _log_utils import save_container_logs as _save_container_logs
@@ -116,13 +116,13 @@ def save_container_logs(ts: str):
 
 def main():
     print("=" * 50)
-    print(" RadixGates — 实时流式响应 Demo (Direct 模式)")
+    print(" RadixGates — real-time SSE streaming check (direct mode)")
     print("=" * 50)
 
     check_mode()
-    print("✅ Gateway: direct 模式（无 Kafka，无 WebSocket，纯 SSE）\n")
+    print("✅ Gateway: direct mode (SSE; no Kafka or WebSocket)\n")
 
-    question = input("请输入你的问题 (直接回车用默认问题): ").strip()
+    question = input("Enter a prompt (press Enter to use the default): ").strip()
     if not question:
         question = "Write a short poem about GPU computing."
 
