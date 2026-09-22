@@ -3,8 +3,8 @@
 RadixGates was created by the UnicoreGPU team and handed to me (Yuchen He) as a project to extend.
 The upstream snapshot carries no licence file. This repository is published with the project
 owner's permission; the imported code is theirs and is tagged `upstream-snapshot`
-(`git diff upstream-snapshot` shows exactly what I changed). The historical README is kept at
-`docs/UPSTREAM_README.md`; its language is normalized to English and its embedded resume blurb is removed.
+(`git diff upstream-snapshot` shows exactly what I changed). The delivered README remains in that immutable tag;
+`docs/UPSTREAM_README.md` links to it without duplicating stale benchmark claims on the current branch.
 
 My additions and rewrites (`gateway-go/breaker`, `gateway-go/router`, `gateway-go/handler/direct.go`,
 `gateway-go/metrics`, `gateway-go/config`, `gateway-go/main.go`, `gateway-go/cmd`, `gateway-go/internal`,

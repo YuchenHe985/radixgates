@@ -12,7 +12,7 @@ bounded retries, load-aware routing, admission control) measured against the ori
 - **Routing under node loss.** Losing 1 of 4 nodes remaps **0%** of the surviving nodes' prefix keys (rendezvous hashing), versus **75.3%** with the original `hash % N`.
 - **Node crash.** Clean completions **85.2% -> 99.7%**. **Gray failure** (`/health` green, inference hung): P99 **11.8 s -> 0.6 s**. Same config, same load, the original built from tag `upstream-snapshot`.
 - **No duplicated output.** A request is retried only before its first byte reaches the client; a stream that breaks mid-way ends with an explicit `upstream_interrupted` event.
-- **53 tests under `go test -race`** (52 added): circuit-breaker state machine, routing, active health probes, admission queue, metrics, and handler integration tests against workers that crash, hang, reset connections and fail mid-stream.
+- **55 tests under `go test -race`** (54 added): circuit-breaker state machine, routing, active health probes, admission queue, metrics, and handler integration tests against workers that crash, hang, reset connections and fail mid-stream.
 - **Real hardware.** The same DP / TP / EP test matrix on 4x RTX 4090 (PCIe) and 4x A100 (NVLink), plus PD disaggregation on the 4090 machine; 8 deployment failures diagnosed or isolated (CUDA image vs driver, removed SGLang flags, NCCL initialisation in Docker, 40 GB OOM, a wedged GPU).
 
 ```mermaid
@@ -50,8 +50,8 @@ tenant quotas, or audit-log sink; request bodies are capped at **4 MiB**, and `/
 restrict the admin and metrics routes, and pin container images/model revisions instead of using `latest`. The gateway accepts both the historical `POST /v1/chat` route and
 the standard `POST /v1/chat/completions` route. See [docs/OPERATING.md](docs/OPERATING.md) for the controls that are implemented.
 
-**Provenance.** The original gateway, README and deployment runbooks come from a project my mentor assigned (UnicoreGPU team); the historical
-README is retained, with language normalized to English, in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md) and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
+**Provenance.** The original gateway, README and deployment runbooks come from a project my mentor assigned (UnicoreGPU team); the delivered source and README are preserved
+immutably at tag [`upstream-snapshot`](https://github.com/YuchenHe985/radixgates/tree/upstream-snapshot), indexed by [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md), and credited in [NOTICE.md](NOTICE.md). Everything after tag `upstream-snapshot`
 is mine: `git diff upstream-snapshot`. Order of work: the real-GPU runs came first (2026-07-27, see [data](benchmarks/results/real_gpu/sglang_parallelism_runs.csv)),
 then the gateway upgrade and the failure-injection benchmark. Design and failure modes: [docs/RELIABILITY.md](docs/RELIABILITY.md). Running it (alerts, settings, troubleshooting): [docs/OPERATING.md](docs/OPERATING.md).
 
@@ -83,7 +83,7 @@ gap between columns is not attributable to interconnect alone ([docs/real-gpu-re
 | Streams that break mid-way | Truncated silently | Client receives an explicit `upstream_interrupted` event; the breaker is charged |
 | Observability | 3 metrics, request histogram capped at 1 s | + upstream attempts by node and result, retries by reason, breaker transitions, mid-stream failures, time to first byte, queue wait, per-node up / breaker / in-flight gauges, `/readyz`, `/admin/nodes` |
 | HTTP client | A new `http.Client` per request | One shared client with connection pooling |
-| Tests | 1 (prefix hash) | 52 more: breaker state machine, router (affinity, remap, bounded load, queue), active health probes, config, metrics, and handler integration tests against fault-injecting workers, all under `go test -race` |
+| Tests | 1 (prefix hash) | 54 more: breaker state machine, router (affinity, remap, bounded load, queue), active health probes, config, metrics, and handler integration tests against fault-injecting workers, all under `go test -race` |
 | Config | JSON | Same file works unchanged; new optional `routing`, `reliability`, `admission` blocks |
 
 Config keys, the PD `role` and `group` semantics and the Docker/compose files are unchanged. The legacy `/v1/chat` endpoint remains; `/v1/chat/completions` is an alias for
@@ -180,7 +180,7 @@ diagnoser and a confounder-aware benchmark comparison.
 ## Try it
 
 ```bash
-make test                                       # vet + 53 tests under -race
+make test                                       # vet + 55 tests under -race
 make bench                                      # original vs upgraded, crash and gray failure, ~2 min (needs go, curl, python3)
 make plots                                      # needs matplotlib
 

@@ -5,7 +5,7 @@ This page routes readers to the current, reproducible evidence for RadixGates. I
 ## Gateway reliability
 
 ```bash
-make test   # go vet and 53 tests under go test -race
+make test   # go vet and 55 tests under go test -race
 make bench  # original versus upgraded gateway under crash and gray-failure scenarios
 make plots  # regenerate the benchmark figures
 ```
